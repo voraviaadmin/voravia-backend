@@ -4,6 +4,7 @@
 
 # Node
 node_modules/
+uploads/
 
 # Logs
 npm-debug.log*
@@ -12,3 +13,4 @@ yarn-error.log*
 
 # OS
 .DS_Store
+
