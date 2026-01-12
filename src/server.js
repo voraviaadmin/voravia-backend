@@ -16,16 +16,25 @@ const port = process.env.PORT || 8787;
 console.log("OPENAI KEY LOADED:", !!process.env.OPENAI_API_KEY);
 
 // ---------- CORS (Expo Web) ----------
-app.use(
-  cors({
-    origin: [
-      "http://localhost:8081",
-      "http://127.0.0.1:8081",
-      "http://localhost:19006",
-      "http://127.0.0.1:19006",
-    ],
-  })
-);
+// ---app.use(
+// ---  cors({
+// ---    origin: [
+// ---      "http://localhost:8081",
+// ---      "http://127.0.0.1:8081",
+// ---      "http://localhost:8082",
+// ---      "http://127.0.0.1:8082",
+// ---      "http://localhost:8083",
+// ---      "http://127.0.0.1:8083",
+// ---      "http://localhost:19006",
+// ---      "http://127.0.0.1:19006",
+// ---    ],
+// ---    methods: ["GET", "POST", "OPTIONS"],
+// ---    allowedHeaders: ["Content-Type"],
+// ---  })
+// ---);
+
+app.use(cors({ origin: true }));
+
 
 app.use(express.json({ limit: "2mb" }));
 
