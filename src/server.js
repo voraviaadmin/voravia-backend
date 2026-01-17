@@ -1,5 +1,7 @@
-// src/server.js – Voravia backend (JSON-tolerant)
-// Fixes: model returning ```json fences / extra text causing JSON.parse to fail.
+// src/server.js – Voravia backend (MVP)
+// Adds: /v1/me (profile-aware family list), /v1/family (alias),
+//       /v1/logs (in-memory), /v1/day-summary, /v1/scans (vision)
+// Keeps: your existing /api/* routes (Places + Menu upload/rate)
 
 import express from "express";
 import cors from "cors";
@@ -15,27 +17,7 @@ const port = process.env.PORT || 8787;
 
 console.log("OPENAI KEY LOADED:", !!process.env.OPENAI_API_KEY);
 
-// ---------- CORS (Expo Web) ----------
-// ---app.use(
-// ---  cors({
-// ---    origin: [
-// ---      "http://localhost:8081",
-// ---      "http://127.0.0.1:8081",
-// ---      "http://localhost:8082",
-// ---      "http://127.0.0.1:8082",
-// ---      "http://localhost:8083",
-// ---      "http://127.0.0.1:8083",
-// ---      "http://localhost:19006",
-// ---      "http://127.0.0.1:19006",
-// ---    ],
-// ---    methods: ["GET", "POST", "OPTIONS"],
-// ---    allowedHeaders: ["Content-Type"],
-// ---  })
-// ---);
-
 app.use(cors({ origin: true }));
-
-
 app.use(express.json({ limit: "2mb" }));
 
 // ---------- OpenAI Client ----------
@@ -54,6 +36,7 @@ const cache = new NodeCache({
   useClones: false,
 });
 
+// ---------- Helpers ----------
 function sha256(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
@@ -65,32 +48,13 @@ function stableJsonKey(obj) {
   return JSON.stringify(out);
 }
 
-function makeUploadKey(files) {
-  const parts = [];
-  for (const f of files) {
-    const b = Buffer.isBuffer(f.buffer) ? f.buffer : Buffer.from([]);
-    const head = b.subarray(0, Math.min(b.length, 1024 * 1024));
-    parts.push(`${f.mimetype || ""}:${b.length}:${sha256(head)}`);
-  }
-  return sha256(Buffer.from(parts.join("|")));
-}
-
-function makeRateKey({ uploadKey, items, profile }) {
-  const itemsKey = sha256(Buffer.from((items || []).join("\n")));
-  const profileKey = sha256(Buffer.from(stableJsonKey(profile || {})));
-  return `rate:${uploadKey || "noUpload"}:${itemsKey}:${profileKey}`;
-}
-
 function extractFirstJson(text) {
   if (!text) throw new Error("Empty model response");
 
   let t = String(text).trim();
-
-  // strip ```json fences
   t = t.replace(/^```json\s*/i, "").replace(/^```\s*/i, "");
   t = t.replace(/\s*```$/i, "").trim();
 
-  // find JSON object
   const firstBrace = t.indexOf("{");
   const lastBrace = t.lastIndexOf("}");
   if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
@@ -105,44 +69,359 @@ function extractFirstJson(text) {
     return "";
   });
 
-  // 1st attempt: normal parse
   try {
     return JSON.parse(sliced);
-  } catch (_) {
-    // 2nd attempt: handle "escaped JSON" like {\"sections\":...}
-    // Convert \" -> " and \\n -> \n etc.
+  } catch {
     const unescaped = sliced
-      .replace(/\\+"/g, '"')     // \" or \\" -> "
-      .replace(/\\\\/g, "\\")    // \\ -> \
+      .replace(/\\+"/g, '"')
+      .replace(/\\\\/g, "\\")
       .replace(/\\n/g, "\n")
       .replace(/\\r/g, "\r")
       .replace(/\\t/g, "\t");
-
     return JSON.parse(unescaped);
   }
 }
 
+function isoDay(d = new Date()) {
+  const dt = new Date(d);
+  const yyyy = dt.getFullYear();
+  const mm = String(dt.getMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
 
-// ---------- PDF text extraction (pdfjs-dist) ----------
-async function extractTextFromPdfBuffer(buffer) {
-  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-  const loadingTask = pdfjs.getDocument({ data: new Uint8Array(buffer) });
-  const pdf = await loadingTask.promise;
-
-  let out = "";
-  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-    const page = await pdf.getPage(pageNum);
-    const content = await page.getTextContent();
-    const strings = content.items
-      .map((it) => (it && it.str ? String(it.str) : ""))
-      .filter(Boolean);
-    out += `\n\n--- PAGE ${pageNum} ---\n${strings.join(" ")}`;
-  }
-  return out.trim();
+function clampScore(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return 0;
+  return Math.max(0, Math.min(100, Math.round(x)));
 }
 
 // ---------- HEALTH CHECK ----------
 app.get("/health", (_, res) => res.json({ ok: true }));
+
+// ============================================================================
+//  MVP "ME" + FAMILY (profile-aware)
+// ============================================================================
+//
+// Rules:
+// - If activeProfile === "individual": family = [ {id:"u_self", name:"Me"} ]
+// - If activeProfile === "family": family = [Head, Spouse, Child1, Child2] (no "Me")
+//
+// How we decide activeProfile (MVP):
+// - query param ?profile=family|individual
+// - OR header x-voravia-profile: family|individual
+// - default: family (matches your current focus)
+//
+const FAMILY_MEMBERS = [
+  { id: "u_head", name: "Head" },
+  { id: "u_spouse", name: "Spouse" },
+  { id: "u_child1", name: "Child 1" },
+  { id: "u_child2", name: "Child 2" },
+];
+
+const ME_STATE = new Map(); // userId -> { mode, activeMemberId }
+
+function getUserId(req) {
+  return String(req.query.userId || req.header("x-user-id") || "u_head").trim();
+}
+
+function resolveMode(req) {
+  // Optional explicit override (dev/testing)
+  const q = String(req.query.profile || "").toLowerCase().trim();
+  const h = String(req.header("x-voravia-profile") || "").toLowerCase().trim();
+  const v = q || h;
+
+  if (v === "individual" || v === "family" || v === "workplace") return v;
+  return null; // no override
+}
+
+
+function ensureMeState(userId) {
+  if (ME_STATE.has(userId)) return ME_STATE.get(userId);
+
+  // Default MVP seed: family mode for u_head, individual for u_self
+  const seeded =
+    userId === "u_self"
+      ? { mode: "individual", activeMemberId: "u_self" }
+      : { mode: "family", activeMemberId: "u_head" };
+
+  ME_STATE.set(userId, seeded);
+  return seeded;
+}
+
+
+function buildMe(req) {
+  const userId = getUserId(req);
+
+  const state = ensureMeState(userId);
+  const overrideMode = resolveMode(req);
+  const mode = overrideMode || state.mode;
+
+  // Build family members list (your existing constant)
+  // Expecting FAMILY_MEMBERS like:
+  // [{id:"u_head", name:"Head"}, {id:"u_spouse", name:"Spouse"}, ...]
+  const members =
+    mode === "family"
+      ? (FAMILY_MEMBERS || []).map((m) => ({
+          id: String(m.id),
+          displayName: String(m.name || m.displayName || m.id),
+        }))
+      : [{ id: "u_self", displayName: "Me" }];
+
+  // active member id
+  const activeMemberId =
+    mode === "family"
+      ? String(state.activeMemberId || "u_head")
+      : "u_self";
+
+  // Persist effective mode back to state unless this was an override
+  if (!overrideMode) {
+    ME_STATE.set(userId, { ...state, mode });
+  }
+
+  return {
+    userId,
+    mode, // ✅ canonical
+    family: {
+      activeMemberId,
+      members,
+    },
+  };
+}
+
+app.get("/v1/me", (req, res) => {
+  res.json(buildMe(req));
+});
+
+app.get("/v1/family", (req, res) => {
+  const me = buildMe(req);
+  res.json({ items: me.family.members, activeMemberId: me.family.activeMemberId, userId: me.userId });
+});
+
+
+// ============================================================================
+//  SIMPLE LOGS (in-memory, structured) + day-summary
+// ============================================================================
+const logs = []; // MVP keep in memory
+
+app.get("/v1/logs", (req, res) => {
+  const userId = String(req.query.userId || "").trim();
+
+  const filtered = userId ? logs.filter((x) => x.userId === userId) : logs;
+  // newest first
+  res.json({ items: filtered.slice().reverse().slice(0, 200) });
+});
+
+app.post("/v1/logs", (req, res) => {
+  const item = req.body || {};
+
+  const entry = {
+    id: `log_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+    createdAt: new Date().toISOString(),
+    day: item.day ? String(item.day) : isoDay(),
+    userId: String(item.userId || "u_self"),
+    mealType: String(item.mealType || "lunch"),
+    source: String(item.source || "scan"),
+    dishName: String(item.dishName || "Unknown dish"),
+    score: clampScore(item.score),
+    label: String(item.label || ""),
+    confidence: Number(item.confidence ?? 0),
+    why: Array.isArray(item.why) ? item.why.map(String) : [],
+    tips: Array.isArray(item.tips) ? item.tips.map(String) : [],
+    nutrition: item.nutrition || item.estimatedNutrition || null,
+    photoUri: item.photoUri ? String(item.photoUri) : "",
+    scanId: item.scanId ? String(item.scanId) : undefined,
+  };
+
+  logs.push(entry);
+  res.json({ ok: true, item: entry });
+});
+
+// Meal weights for DAILY score (Phase 1)
+const MEAL_WEIGHTS = {
+  breakfast: 0.25,
+  lunch: 0.30,
+  dinner: 0.35,
+  snack: 0.10,
+};
+
+function caloriesOf(log) {
+  const n = log?.nutrition || {};
+  const c = Number(n.caloriesKcal ?? n.calories ?? 0);
+  return Number.isFinite(c) && c > 0 ? c : 0;
+}
+
+function weightedAvgScore(items) {
+  // calories-weighted if we have calories; else simple average
+  const withCals = items.filter((x) => caloriesOf(x) > 0);
+  if (withCals.length) {
+    let wSum = 0;
+    let sSum = 0;
+    for (const it of withCals) {
+      const w = caloriesOf(it);
+      wSum += w;
+      sSum += w * clampScore(it.score);
+    }
+    return wSum > 0 ? sSum / wSum : 0;
+  }
+
+  if (!items.length) return 0;
+  const sum = items.reduce((a, x) => a + clampScore(x.score), 0);
+  return sum / items.length;
+}
+
+app.get("/v1/day-summary", (req, res) => {
+  const userId = String(req.query.userId || "").trim() || "u_self";
+  const day = String(req.query.day || "").trim() || isoDay();
+
+  const dayLogs = logs.filter((x) => x.userId === userId && String(x.day) === day);
+
+  const byMeal = {
+    breakfast: dayLogs.filter((x) => x.mealType === "breakfast"),
+    lunch: dayLogs.filter((x) => x.mealType === "lunch"),
+    dinner: dayLogs.filter((x) => x.mealType === "dinner"),
+    snack: dayLogs.filter((x) => x.mealType === "snack"),
+  };
+
+  // meal scores (multiple items per meal -> calories-weighted avg)
+  const mealScore = {
+    breakfast: weightedAvgScore(byMeal.breakfast),
+    lunch: weightedAvgScore(byMeal.lunch),
+    dinner: weightedAvgScore(byMeal.dinner),
+    snack: weightedAvgScore(byMeal.snack),
+  };
+
+  // day score = weighted average across meals actually logged
+  let totalW = 0;
+  let totalS = 0;
+  for (const mt of ["breakfast", "lunch", "dinner", "snack"]) {
+    const list = byMeal[mt];
+    if (!list.length) continue;
+    const w = MEAL_WEIGHTS[mt] ?? 0;
+    totalW += w;
+    totalS += w * (mealScore[mt] ?? 0);
+  }
+  const dailyScore = totalW > 0 ? totalS / totalW : 0;
+
+  // simple “next win” suggestion (Phase 1)
+  const nextWin = [];
+  if (!dayLogs.length) nextWin.push("Log one meal to start your day score");
+  else if (dailyScore < 50) nextWin.push("Next meal: aim for protein + fiber (avoid sugary / fried)");
+  else if (dailyScore < 70) nextWin.push("Next meal: add fiber (veggies/whole grains) and keep sodium moderate");
+  else nextWin.push("Next meal: keep balance—protein + veggies, watch extra sodium");
+
+  res.json({
+    userId,
+    day,
+    dailyScore: Math.round(dailyScore),
+    mealScore: {
+      breakfast: Math.round(mealScore.breakfast || 0),
+      lunch: Math.round(mealScore.lunch || 0),
+      dinner: Math.round(mealScore.dinner || 0),
+      snack: Math.round(mealScore.snack || 0),
+    },
+    nextWin,
+  });
+});
+
+// ============================================================================
+//  SCAN (vision) – /v1/scans
+// ============================================================================
+app.post("/v1/scans", upload.single("image"), async (req, res) => {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "MISSING_OPENAI_API_KEY" });
+    }
+    if (!req.file?.buffer) {
+      return res.status(400).json({ error: "Missing image file (field: image)" });
+    }
+
+    const profileRaw = req.body?.profile;
+    let profile = {};
+    try {
+      profile = profileRaw ? JSON.parse(profileRaw) : {};
+    } catch {
+      profile = {};
+    }
+
+    const imgB64 = req.file.buffer.toString("base64");
+    const mime = String(req.file.mimetype || "image/jpeg");
+
+    const cacheKey = `scan:${sha256(req.file.buffer)}:${sha256(Buffer.from(stableJsonKey(profile)))}`;
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json({ ...cached, cached: true });
+
+    const instruction =
+      `Return ONLY valid JSON (no markdown). Schema:\n` +
+      `{\n` +
+      `  "dishName": string,\n` +
+      `  "confidence": number,     // 0-100\n` +
+      `  "score": number,          // 0-100 overall health fit\n` +
+      `  "why": string[],          // 2-6 bullets\n` +
+      `  "tips": string[],         // 2-6 bullets\n` +
+      `  "estimatedNutrition": {\n` +
+      `    "caloriesKcal": number,\n` +
+      `    "proteinG": number,\n` +
+      `    "carbsG": number,\n` +
+      `    "fatG": number,\n` +
+      `    "fiberG": number,\n` +
+      `    "sugarG": number,\n` +
+      `    "sodiumMg": number\n` +
+      `  }\n` +
+      `}\n\n` +
+      `Personalization (may be empty): ${JSON.stringify(profile)}\n`;
+
+    const response = await openai.responses.create({
+      model: "gpt-4.1-mini",
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: instruction },
+            {
+              type: "input_image",
+              image_url: `data:${mime};base64,${imgB64}`,
+            },
+          ],
+        },
+      ],
+    });
+
+    const modelText = response?.output?.[0]?.content?.[0]?.text ?? "{}";
+    const parsed = extractFirstJson(modelText);
+
+    const payload = {
+      scanId: `scan_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      dishName: String(parsed?.dishName || "Unknown dish"),
+      confidence: clampScore(parsed?.confidence ?? 0),
+      score: clampScore(parsed?.score ?? 0),
+      why: Array.isArray(parsed?.why) ? parsed.why.map(String).slice(0, 6) : [],
+      tips: Array.isArray(parsed?.tips) ? parsed.tips.map(String).slice(0, 6) : [],
+      estimatedNutrition: {
+        caloriesKcal: Number(parsed?.estimatedNutrition?.caloriesKcal ?? 0) || 0,
+        proteinG: Number(parsed?.estimatedNutrition?.proteinG ?? 0) || 0,
+        carbsG: Number(parsed?.estimatedNutrition?.carbsG ?? 0) || 0,
+        fatG: Number(parsed?.estimatedNutrition?.fatG ?? 0) || 0,
+        fiberG: Number(parsed?.estimatedNutrition?.fiberG ?? 0) || 0,
+        sugarG: Number(parsed?.estimatedNutrition?.sugarG ?? 0) || 0,
+        sodiumMg: Number(parsed?.estimatedNutrition?.sodiumMg ?? 0) || 0,
+      },
+      profileUsed: profile,
+      cached: false,
+      source: "openai",
+    };
+
+    cache.set(cacheKey, payload);
+    return res.json(payload);
+  } catch (err) {
+    console.error("scan error:", err);
+    return res.status(500).json({ error: "scan_error", message: err?.message || String(err) });
+  }
+});
+
+// ============================================================================
+//  Your existing /api/* routes (Places + Menu) – unchanged from your file
+// ============================================================================
 
 function clampInt(val, min, max, fallback) {
   const n = Number(val);
@@ -265,7 +544,41 @@ app.get("/api/places/search", async (req, res) => {
   }
 });
 
-// ---------- MENU EXTRACT UPLOAD (PDF/images) + caching ----------
+// ---------- PDF text extraction (pdfjs-dist) ----------
+async function extractTextFromPdfBuffer(buffer) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const loadingTask = pdfjs.getDocument({ data: new Uint8Array(buffer) });
+  const pdf = await loadingTask.promise;
+
+  let out = "";
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+    const strings = content.items
+      .map((it) => (it && it.str ? String(it.str) : ""))
+      .filter(Boolean);
+    out += `\n\n--- PAGE ${pageNum} ---\n${strings.join(" ")}`;
+  }
+  return out.trim();
+}
+
+function makeUploadKey(files) {
+  const parts = [];
+  for (const f of files) {
+    const b = Buffer.isBuffer(f.buffer) ? f.buffer : Buffer.from([]);
+    const head = b.subarray(0, Math.min(b.length, 1024 * 1024));
+    parts.push(`${f.mimetype || ""}:${b.length}:${sha256(head)}`);
+  }
+  return sha256(Buffer.from(parts.join("|")));
+}
+
+function makeRateKey({ uploadKey, items, profile }) {
+  const itemsKey = sha256(Buffer.from((items || []).join("\n")));
+  const profileKey = sha256(Buffer.from(stableJsonKey(profile || {})));
+  return `rate:${uploadKey || "noUpload"}:${itemsKey}:${profileKey}`;
+}
+
+// ---------- MENU EXTRACT UPLOAD ----------
 app.post("/api/menu/extract-upload", upload.array("files", 6), async (req, res) => {
   res.set("X-Voravia-Menu", "upload-v2");
 
@@ -304,15 +617,14 @@ app.post("/api/menu/extract-upload", upload.array("files", 6), async (req, res) 
     }
 
     const instruction =
-    `Return ONLY valid JSON (no markdown). Schema:\n` +
-    `{"sections":[{"name":string,"items":[{"name":string,"description":string|null,"price":string|null}]}]}\n` +
-    `Rules:\n` +
-    `- keep section names\n` +
-    `- dedupe items by name\n` +
-    `- price/desc null if missing\n` +
-    `- LIMIT output to max 12 sections and max 25 items per section\n` +
-    `- DO NOT include rawText or any extra fields\n`;
-  
+      `Return ONLY valid JSON (no markdown). Schema:\n` +
+      `{"sections":[{"name":string,"items":[{"name":string,"description":string|null,"price":string|null}]}]}\n` +
+      `Rules:\n` +
+      `- keep section names\n` +
+      `- dedupe items by name\n` +
+      `- price/desc null if missing\n` +
+      `- LIMIT output to max 12 sections and max 25 items per section\n` +
+      `- DO NOT include rawText or any extra fields\n`;
 
     const userContent = [
       { type: "input_text", text: instruction + (pdfText ? `\n\nPDF:\n${pdfText}\n` : "") },
@@ -334,14 +646,11 @@ app.post("/api/menu/extract-upload", upload.array("files", 6), async (req, res) 
         error: "menu_upload_parse_error",
         message: "Model did not return valid JSON.",
         raw: String(modelText).slice(0, 1200),
-        hint: "Server now strips ```json fences and parses first {...}. If still failing, your model output is malformed.",
       });
     }
 
     const sections = Array.isArray(parsedJson.sections) ? parsedJson.sections : [];
-    //const rawText = typeof parsedJson.rawText === "string" ? parsedJson.rawText : "";
 
-    // Clean + dedupe
     const seen = new Set();
     const cleanSections = sections
       .map((sec) => {
@@ -377,7 +686,7 @@ app.post("/api/menu/extract-upload", upload.array("files", 6), async (req, res) 
   }
 });
 
-// ---------- MENU RATE (AI estimate + rules) + caching ----------
+// ---------- MENU RATE ----------
 app.post("/api/menu/rate", async (req, res) => {
   try {
     if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
@@ -452,7 +761,6 @@ app.post("/api/menu/rate", async (req, res) => {
       allEstimated.push(...est);
     }
 
-    // Minimal scoring (keep it simple for now)
     const rated = items.map((input, idx) => {
       const e = allEstimated.find((x) => String(x?.input ?? "").trim() === input) || allEstimated[idx] || {};
       const calories = Number(e.calories ?? 0);
@@ -485,7 +793,7 @@ app.post("/api/menu/rate", async (req, res) => {
         reasons.push("Good fiber");
       }
 
-      score = Math.max(0, Math.min(100, Math.round(score)));
+      score = clampScore(score);
       const verdict = score >= 80 ? "FIT" : score >= 60 ? "MODERATE" : "AVOID";
 
       return {
