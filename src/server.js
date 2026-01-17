@@ -96,6 +96,87 @@ function clampScore(n) {
   return Math.max(0, Math.min(100, Math.round(x)));
 }
 
+// ============================================================================
+//  PERSONALITY (MVP): per-member health preferences used for scoring
+// ============================================================================
+// Keep simple + safe: seeded in-memory defaults; can be edited later via PATCH /v1/me if desired.
+const MEMBER_PREFERENCES = {
+  u_head: {
+    goals: ["balanced", "high_protein"],
+    avoid: ["excess_sugar"],
+    cuisines: ["indian", "mediterranean"],
+    notes: "Prefers higher protein and balanced meals; limit sugary items.",
+  },
+  u_spouse: {
+    goals: ["low_sodium", "balanced"],
+    avoid: ["excess_sodium"],
+    notes: "Watches sodium; prefers lighter meals.",
+  },
+  u_child1: {
+    goals: ["balanced"],
+    avoid: ["high_sugar"],
+    notes: "Kid-friendly but avoid very sugary foods/drinks.",
+  },
+  u_child2: {
+    goals: ["balanced"],
+    avoid: ["high_sugar"],
+    notes: "Kid-friendly but avoid very sugary foods/drinks.",
+  },
+  u_self: {
+    goals: ["balanced"],
+    avoid: [],
+    notes: "Default preferences.",
+  },
+};
+
+function getMemberIdForScan(req) {
+  // 1) explicit query param
+  const q = String(req.query.memberId || "").trim();
+  if (q) return q;
+
+  // 2) explicit form body field (optional)
+  const b = String(req.body?.memberId || "").trim();
+  if (b) return b;
+
+  // 3) fallback to canonical /v1/me active member
+  try {
+    const me = buildMe(req);
+    return String(me?.family?.activeMemberId || "u_self");
+  } catch {
+    return "u_self";
+  }
+}
+
+function mergeProfile(userProfile, memberPrefs) {
+  const a = userProfile && typeof userProfile === "object" ? userProfile : {};
+  const b = memberPrefs && typeof memberPrefs === "object" ? memberPrefs : {};
+
+  // Merge arrays by union
+  const unionArr = (x, y) => {
+    const ax = Array.isArray(x) ? x : [];
+    const ay = Array.isArray(y) ? y : [];
+    const seen = new Set();
+    const out = [];
+    for (const v of [...ay, ...ax]) {
+      const s = String(v);
+      if (!seen.has(s)) {
+        seen.add(s);
+        out.push(s);
+      }
+    }
+    return out;
+  };
+
+  return {
+    ...b, // member prefs first (baseline)
+    ...a, // user supplied overrides
+    goals: unionArr(a.goals, b.goals),
+    avoid: unionArr(a.avoid, b.avoid),
+  };
+}
+
+
+
 // ---------- HEALTH CHECK ----------
 app.get("/health", (_, res) => res.json({ ok: true }));
 
@@ -181,17 +262,54 @@ function buildMe(req) {
 
   return {
     userId,
-    mode, // ✅ canonical
+    mode,
     family: {
       activeMemberId,
       members,
     },
+    preferences: {
+      byMemberId: MEMBER_PREFERENCES,
+    },
   };
+  
 }
 
 app.get("/v1/me", (req, res) => {
   res.json(buildMe(req));
 });
+
+
+// PATCH /v1/me
+// Body examples:
+// { "mode": "family" }
+// { "family": { "activeMemberId": "u_spouse" } }
+// { "mode": "individual", "family": { "activeMemberId": "u_self" } }
+
+app.patch("/v1/me", (req, res) => {
+  const userId = getUserId(req);
+
+  // ensure state exists
+  const state = ensureMeState(userId);
+
+  const body = req.body || {};
+
+  // update mode if provided
+  if (body.mode === "individual" || body.mode === "family" || body.mode === "workplace") {
+    state.mode = body.mode;
+  }
+
+  // update active member if provided
+  if (body.family && body.family.activeMemberId !== undefined) {
+    state.activeMemberId = String(body.family.activeMemberId || "").trim() || null;
+  }
+
+  ME_STATE.set(userId, state);
+
+  // respond with canonical /v1/me shape
+  res.json(buildMe(req));
+});
+
+
 
 app.get("/v1/family", (req, res) => {
   const me = buildMe(req);
@@ -324,10 +442,346 @@ app.get("/v1/day-summary", (req, res) => {
   });
 });
 
+
+// ============================================================================
+//  HOME RECOMMENDATIONS – /v1/home-recommendations
+//  - Uses /v1/me + in-memory logs + MEMBER_PREFERENCES (personality)
+//  - Returns next meal focus + 3 food suggestions
+// ============================================================================
+function normalizeGoalTokens(prefs) {
+  const goals = Array.isArray(prefs?.goals) ? prefs.goals.map((x) => String(x).toLowerCase()) : [];
+  const avoid = Array.isArray(prefs?.avoid) ? prefs.avoid.map((x) => String(x).toLowerCase()) : [];
+  const cuisines = Array.isArray(prefs?.cuisines)
+    ? prefs.cuisines.map((x) => String(x).toLowerCase())
+    : [];
+  return { goals, avoid, cuisines };
+}
+
+function sumNutrition(items) {
+  const out = {
+    caloriesKcal: 0,
+    proteinG: 0,
+    carbsG: 0,
+    fatG: 0,
+    fiberG: 0,
+    sugarG: 0,
+    sodiumMg: 0,
+    hasAny: false,
+  };
+
+  for (const it of items || []) {
+    const n = it?.nutrition || it?.estimatedNutrition || null;
+    if (!n || typeof n !== "object") continue;
+
+    const cals = Number(n.caloriesKcal ?? n.calories ?? 0);
+    const protein = Number(n.proteinG ?? n.protein_g ?? n.protein ?? 0);
+    const carbs = Number(n.carbsG ?? n.carbs_g ?? n.carbs ?? 0);
+    const fat = Number(n.fatG ?? n.fat_g ?? n.fat ?? 0);
+    const fiber = Number(n.fiberG ?? n.fiber_g ?? n.fiber ?? 0);
+    const sugar = Number(n.sugarG ?? n.sugar_g ?? n.sugar ?? 0);
+    const sodium = Number(n.sodiumMg ?? n.sodium_mg ?? n.sodium ?? 0);
+
+    if (
+      Number.isFinite(cals) ||
+      Number.isFinite(protein) ||
+      Number.isFinite(carbs) ||
+      Number.isFinite(fat) ||
+      Number.isFinite(fiber) ||
+      Number.isFinite(sugar) ||
+      Number.isFinite(sodium)
+    ) {
+      out.hasAny = true;
+    }
+
+    out.caloriesKcal += Number.isFinite(cals) ? cals : 0;
+    out.proteinG += Number.isFinite(protein) ? protein : 0;
+    out.carbsG += Number.isFinite(carbs) ? carbs : 0;
+    out.fatG += Number.isFinite(fat) ? fat : 0;
+    out.fiberG += Number.isFinite(fiber) ? fiber : 0;
+    out.sugarG += Number.isFinite(sugar) ? sugar : 0;
+    out.sodiumMg += Number.isFinite(sodium) ? sodium : 0;
+  }
+
+  // Round for readability
+  out.caloriesKcal = Math.round(out.caloriesKcal);
+  out.proteinG = Math.round(out.proteinG);
+  out.carbsG = Math.round(out.carbsG);
+  out.fatG = Math.round(out.fatG);
+  out.fiberG = Math.round(out.fiberG);
+  out.sugarG = Math.round(out.sugarG);
+  out.sodiumMg = Math.round(out.sodiumMg);
+
+  return out;
+}
+
+function pickRecentDishKeywords(dayLogs) {
+  // Very light heuristic: use last 8 dish names as "signal"
+  const recent = (dayLogs || []).slice(-8).map((x) => String(x?.dishName || "").toLowerCase());
+  const joined = recent.join(" ");
+  const hints = [];
+  if (joined.includes("salad")) hints.push("salad");
+  if (joined.includes("chicken")) hints.push("chicken");
+  if (joined.includes("yogurt")) hints.push("yogurt");
+  if (joined.includes("rice")) hints.push("rice");
+  if (joined.includes("lentil")) hints.push("lentils");
+  if (joined.includes("oat") || joined.includes("oatmeal")) hints.push("oats");
+  return Array.from(new Set(hints)).slice(0, 4);
+}
+
+function buildFocus({ goals, avoid }, totals, dayScore, mealsLogged) {
+  // Default
+  let focus = "Keep balance—protein + veggies, watch extra sodium";
+  let reason = mealsLogged
+    ? "Based on today’s logged meals."
+    : "Log a meal to start getting personalized suggestions.";
+
+  if (!mealsLogged) {
+    return { focus: "Log your next meal to personalize suggestions", reason };
+  }
+
+  // If we have nutrition, use it
+  if (totals?.hasAny) {
+    // Simple thresholds (MVP)
+    const lowFiber = totals.fiberG < 15;
+    const highSodium = totals.sodiumMg > 1800;
+    const highSugar = totals.sugarG > 45;
+    const lowProtein = totals.proteinG < 60;
+
+    // Preference-aware prioritization
+    if (goals.includes("low_sodium") || avoid.includes("excess_sodium")) {
+      if (highSodium) {
+        return {
+          focus: "Keep sodium low · add potassium + fiber",
+          reason: `Today’s sodium is ~${totals.sodiumMg}mg. Next meal: choose fresh foods, avoid salty sauces.`,
+        };
+      }
+    }
+
+    if (avoid.includes("excess_sugar") || avoid.includes("high_sugar")) {
+      if (highSugar) {
+        return {
+          focus: "Reduce added sugar · increase protein/fiber",
+          reason: `Today’s sugar is ~${totals.sugarG}g. Next meal: go protein + fiber to stabilize energy.`,
+        };
+      }
+    }
+
+    if (goals.includes("high_protein")) {
+      if (lowProtein) {
+        return {
+          focus: "Add protein · keep carbs/fats balanced",
+          reason: `Today’s protein is ~${totals.proteinG}g. Next meal: include lean protein + veggies.`,
+        };
+      }
+    }
+
+    if (goals.includes("high_fiber") || lowFiber) {
+      if (lowFiber) {
+        return {
+          focus: "Add fiber · keep sodium moderate",
+          reason: `Today’s fiber is ~${totals.fiberG}g. Next meal: vegetables/beans/whole grains.`,
+        };
+      }
+    }
+  }
+
+  // Score-based fallback
+  if (dayScore < 50) {
+    focus = "Next meal: aim for protein + fiber (avoid sugary / fried)";
+    reason = "Today’s average score is low—focus on a high-quality next meal.";
+  } else if (dayScore < 70) {
+    focus = "Next meal: add fiber (veggies/whole grains) and keep sodium moderate";
+    reason = "A small quality upgrade on your next meal will boost your daily score.";
+  } else {
+    focus = "Next meal: keep the balance—protein + veggies, watch extra sodium";
+    reason = "You’re doing well today—keep consistency.";
+  }
+
+  return { focus, reason };
+}
+
+function buildSuggestionPool({ goals, avoid, cuisines }, recentHints) {
+  // Generic goal pools (safe MVP)
+  const pools = {
+    default: [
+      { name: "Grilled chicken salad with olive oil + lemon", why: "High protein + fiber; minimal added sugar." },
+      { name: "Greek yogurt with berries + chia", why: "Protein + fiber; supports steady energy." },
+      { name: "Veggie omelette with whole grain toast", why: "Protein + micronutrients; balanced meal." },
+      { name: "Lentil soup + side salad", why: "Fiber + plant protein; satisfying and heart-friendly." },
+      { name: "Quinoa bowl with roasted veggies", why: "Fiber + complex carbs; easy to keep low sodium." },
+    ],
+    low_sodium: [
+      { name: "Salmon + quinoa + steamed broccoli", why: "Naturally low sodium; high protein and omega-3s." },
+      { name: "Chicken/Tofu stir-fry (no-salt sauce) + veggies", why: "High volume, low sodium if sauce is controlled." },
+      { name: "Turkey/bean lettuce wraps", why: "Lower sodium than wraps/bread; high protein." },
+      { name: "Greek salad + grilled protein", why: "Fresh ingredients; easy to control sodium." },
+    ],
+    high_protein: [
+      { name: "Chicken shawarma bowl (light sauce)", why: "High protein; add veggies for fiber." },
+      { name: "Cottage cheese + fruit + nuts", why: "Very high protein; nutrient-dense." },
+      { name: "Tuna salad on whole grain", why: "High protein; add fiber via whole grain/veg." },
+      { name: "Egg + veggie scramble", why: "Fast, high protein; flexible." },
+    ],
+    high_fiber: [
+      { name: "Lentil/bean chili + side salad", why: "High fiber; helps fullness and gut health." },
+      { name: "Overnight oats + berries + chia", why: "High fiber breakfast; low effort." },
+      { name: "Quinoa + black beans + veggies bowl", why: "Fiber + protein; balanced." },
+      { name: "Hummus + veggie plate + whole grain pita", why: "Fiber and healthy fats." },
+    ],
+    reduce_sugar: [
+      { name: "Greek yogurt (unsweetened) + berries", why: "Lower sugar; high protein." },
+      { name: "Eggs + avocado + veggies", why: "No added sugar; balanced fats/protein." },
+      { name: "Chicken salad (no sweet dressing)", why: "Lower sugar; good protein/fiber." },
+      { name: "Chia pudding (no added sugar)", why: "Fiber + healthy fats; sweeten naturally." },
+    ],
+  };
+
+  // Cuisine “skins” (lightweight; no OpenAI needed)
+  const cuisineAdds = {
+    indian: [
+      { name: "Dal (lentils) + brown rice + cucumber salad", why: "High fiber + protein; easy to keep sodium moderate." },
+      { name: "Tandoori chicken + veggies", why: "High protein; avoid heavy creamy sauces." },
+    ],
+    mexican: [
+      { name: "Chicken fajita bowl (no queso, light salsa)", why: "High protein; control sodium via salsa/seasoning." },
+      { name: "Bean + veggie burrito bowl", why: "Fiber + protein; balanced carbs." },
+    ],
+    mediterranean: [
+      { name: "Greek salad + grilled chicken", why: "Fiber + protein; heart-friendly fats." },
+      { name: "Hummus bowl + veggies + quinoa", why: "Fiber + healthy fats; balanced." },
+    ],
+    chinese: [
+      { name: "Steamed chicken + broccoli + rice (light sauce)", why: "Protein + veggies; keep sodium low by controlling sauce." },
+      { name: "Tofu + mixed vegetables stir-fry", why: "Plant protein + fiber; flexible." },
+    ],
+    american: [
+      { name: "Turkey burger lettuce wrap + side salad", why: "High protein; lower refined carbs." },
+      { name: "Grilled chicken + roasted veggies", why: "Simple, high quality meal." },
+    ],
+  };
+
+  // Determine primary pool from goals/avoid
+  let base = pools.default;
+
+  if (goals.includes("low_sodium") || avoid.includes("excess_sodium")) base = base.concat(pools.low_sodium);
+  if (goals.includes("high_protein")) base = base.concat(pools.high_protein);
+  if (goals.includes("high_fiber")) base = base.concat(pools.high_fiber);
+  if (avoid.includes("excess_sugar") || avoid.includes("high_sugar")) base = base.concat(pools.reduce_sugar);
+
+  // Add cuisine-specific suggestions
+  for (const c of cuisines) {
+    if (cuisineAdds[c]) base = cuisineAdds[c].concat(base);
+  }
+
+  // Small personalization from recent hints (very light)
+  if (recentHints.includes("salad")) base = [{ name: "Big salad + lean protein + beans", why: "Leans into what you already eat; increases fiber/protein." }].concat(base);
+  if (recentHints.includes("oats")) base = [{ name: "Overnight oats + chia + berries", why: "Matches your recent pattern; boosts fiber." }].concat(base);
+
+  // Deduplicate by name, keep order
+  const seen = new Set();
+  const out = [];
+  for (const it of base) {
+    const key = String(it.name).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(it);
+    if (out.length >= 12) break;
+  }
+  return out;
+}
+
+app.get("/v1/home-recommendations", (req, res) => {
+  const day = String(req.query.day || "").trim() || isoDay();
+
+  // Use explicit memberId if provided; else use /v1/me active member; else u_self
+  let memberId = String(req.query.memberId || "").trim();
+  if (!memberId) {
+    try {
+      const me = buildMe(req);
+      memberId = String(me?.family?.activeMemberId || me?.userId || "u_self");
+    } catch {
+      memberId = "u_self";
+    }
+  }
+
+  const prefs = (typeof MEMBER_PREFERENCES === "object" && MEMBER_PREFERENCES[memberId]) || {};
+  const { goals, avoid, cuisines } = normalizeGoalTokens(prefs);
+
+  function buildThresholds(goals, avoid) {
+    // defaults (per-day)
+    let proteinMin = 60;
+    let fiberMin = 20;
+    let sugarMax = 45;
+    let sodiumMax = 1800;
+  
+    // profile-aware tweaks
+    if (goals.includes("high_protein")) proteinMin = 90;
+    if (goals.includes("high_fiber")) fiberMin = 28;
+  
+    if (avoid.includes("excess_sugar") || avoid.includes("high_sugar")) sugarMax = 30;
+    if (goals.includes("low_sodium") || avoid.includes("excess_sodium")) sodiumMax = 1500;
+  
+    return { proteinMin, fiberMin, sugarMax, sodiumMax };
+  }
+  
+  const thresholds = buildThresholds(goals, avoid);
+  
+
+
+  const dayLogs = logs.filter((x) => x.userId === memberId && String(x.day) === day);
+  const mealsLogged = dayLogs.length;
+
+  // Avg score (simple average; you can swap to weightedAvgScore if desired)
+  const avgScore =
+    mealsLogged > 0
+      ? Math.round(dayLogs.reduce((a, x) => a + clampScore(x.score), 0) / mealsLogged)
+      : 0;
+
+  const totals = sumNutrition(dayLogs);
+
+  const nextMeal = buildFocus({ goals, avoid }, totals, avgScore, mealsLogged);
+
+  const recentHints = pickRecentDishKeywords(dayLogs);
+  const pool = buildSuggestionPool({ goals, avoid, cuisines }, recentHints);
+
+  // pick top 3
+  const suggestions = pool.slice(0, 3);
+
+  res.json({
+    memberId,
+    day,
+    todaySummary: {
+      mealsLogged,
+      avgScore,
+      nutritionTotals: totals.hasAny ? totals : null,
+    },
+    nextMeal,
+    suggestions,
+    thresholds,
+    debug: process.env.NODE_ENV !== "production"
+      ? {
+          goals,
+          avoid,
+          cuisines,
+          recentHints,
+        }
+      : undefined,
+  });
+});
+
+
+
+
 // ============================================================================
 //  SCAN (vision) – /v1/scans
 // ============================================================================
 app.post("/v1/scans", upload.single("image"), async (req, res) => {
+
+  const memberId = String(req.query.memberId || "").trim() || "u_self";
+  const memberPrefs = (MEMBER_PREFERENCES && MEMBER_PREFERENCES[memberId]) || {};
+  let profile = {};
+  let effectiveProfile = {};
+
   try {
     if (!process.env.OPENAI_API_KEY) {
       return res.status(500).json({ error: "MISSING_OPENAI_API_KEY" });
@@ -337,17 +791,25 @@ app.post("/v1/scans", upload.single("image"), async (req, res) => {
     }
 
     const profileRaw = req.body?.profile;
-    let profile = {};
     try {
       profile = profileRaw ? JSON.parse(profileRaw) : {};
     } catch {
       profile = {};
     }
 
+
+    effectiveProfile =
+    typeof mergeProfile === "function"
+      ? mergeProfile(profile, memberPrefs)
+      : { ...memberPrefs, ...profile };
+
     const imgB64 = req.file.buffer.toString("base64");
     const mime = String(req.file.mimetype || "image/jpeg");
 
-    const cacheKey = `scan:${sha256(req.file.buffer)}:${sha256(Buffer.from(stableJsonKey(profile)))}`;
+    const cacheKey = `scan:${sha256(req.file.buffer)}:${memberId}:${sha256(
+      Buffer.from(stableJsonKey(effectiveProfile))
+    )}`;
+
     const cached = cache.get(cacheKey);
     if (cached) return res.json({ ...cached, cached: true });
 
@@ -369,7 +831,11 @@ app.post("/v1/scans", upload.single("image"), async (req, res) => {
       `    "sodiumMg": number\n` +
       `  }\n` +
       `}\n\n` +
-      `Personalization (may be empty): ${JSON.stringify(profile)}\n`;
+      `Personalization (member-specific): ${JSON.stringify({
+        memberId,
+        ...effectiveProfile,
+      })}\n`;
+
 
     const response = await openai.responses.create({
       model: "gpt-4.1-mini",
@@ -406,7 +872,9 @@ app.post("/v1/scans", upload.single("image"), async (req, res) => {
         sugarG: Number(parsed?.estimatedNutrition?.sugarG ?? 0) || 0,
         sodiumMg: Number(parsed?.estimatedNutrition?.sodiumMg ?? 0) || 0,
       },
-      profileUsed: profile,
+      memberIdUsed: memberId,
+      profileUsed: effectiveProfile,
+
       cached: false,
       source: "openai",
     };
