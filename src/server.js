@@ -160,6 +160,148 @@ function requireAdmin(req, res) {
   return true;
 }
 
+// ============================================================================
+//  ADMIN METRICS (app owner)
+//  - Protected by x-admin-token === process.env.ADMIN_TOKEN
+// ============================================================================
+
+app.get("/admin/metrics/summary", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+
+  const days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
+  const provider = String(req.query.provider || "all").trim().toLowerCase();
+
+  const start = new Date();
+  start.setUTCDate(start.getUTCDate() - days);
+  const startDay = isoDayUtc(start);
+
+  const providerSql = provider === "all" ? "" : " AND provider = @provider ";
+
+  // Rollup totals (historical days)
+  const totalRollupUsd =
+    usageDb.prepare(`
+      SELECT COALESCE(SUM(costUsd), 0) AS c
+      FROM daily_usage_rollups
+      WHERE day >= @startDay
+      ${providerSql}
+    `).get({ startDay, provider })?.c ?? 0;
+
+  // Today so far (live events, not in yesterday rollup)
+  const now = new Date();
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const todayStartTs = todayStart.toISOString();
+  const nowTs = now.toISOString();
+
+  const todaySoFarUsd = usageStore.sumRange({
+    billingOwnerId: "", // ignored by query builder if blank? we'll handle below
+    provider,
+    startTs: todayStartTs,
+    endTs: nowTs,
+  });
+
+  // If you want totals across ALL billing owners, we need a version that doesn't require billingOwnerId.
+  // Quick pragmatic approach: query DB directly for today:
+  const todayRow = usageDb.prepare(`
+    SELECT COALESCE(SUM(costUsd), 0) AS c
+    FROM usage_events
+    WHERE ts >= @startTs AND ts < @endTs
+    ${provider === "all" ? "" : " AND provider = @provider "}
+  `).get({ startTs: todayStartTs, endTs: nowTs, provider });
+
+  const todayUsd = Number(todayRow?.c) || 0;
+
+  // Top services (rollups + today events)
+  const byServiceRollup = usageDb.prepare(`
+    SELECT provider, service, COALESCE(SUM(costUsd), 0) AS costUsd, COALESCE(SUM(events), 0) AS events
+    FROM daily_usage_rollups
+    WHERE day >= @startDay
+    ${providerSql}
+    GROUP BY provider, service
+    ORDER BY costUsd DESC
+    LIMIT 50
+  `).all({ startDay, provider });
+
+  const byServiceToday = usageDb.prepare(`
+    SELECT provider, service, COALESCE(SUM(costUsd), 0) AS costUsd, COALESCE(COUNT(1), 0) AS events
+    FROM usage_events
+    WHERE ts >= @startTs AND ts < @endTs
+    ${provider === "all" ? "" : " AND provider = @provider "}
+    GROUP BY provider, service
+    ORDER BY costUsd DESC
+    LIMIT 50
+  `).all({ startTs: todayStartTs, endTs: nowTs, provider });
+
+  // Merge services
+  const key = (p, s) => `${p}::${s}`;
+  const map = new Map();
+  for (const r of byServiceRollup) {
+    map.set(key(r.provider, r.service), {
+      provider: r.provider,
+      service: r.service,
+      costUsd: Number(r.costUsd) || 0,
+      events: Number(r.events) || 0,
+    });
+  }
+  for (const r of byServiceToday) {
+    const k = key(r.provider, r.service);
+    const prev = map.get(k) || { provider: r.provider, service: r.service, costUsd: 0, events: 0 };
+    prev.costUsd += Number(r.costUsd) || 0;
+    prev.events += Number(r.events) || 0;
+    map.set(k, prev);
+  }
+
+  const byService = Array.from(map.values()).sort((a, b) => (b.costUsd || 0) - (a.costUsd || 0));
+
+  res.json({
+    windowDays: days,
+    provider,
+    startDay,
+    todayStartTs,
+    totals: {
+      rollupUsd: Number(totalRollupUsd) || 0,
+      todaySoFarUsd: todayUsd,
+      totalUsd: (Number(totalRollupUsd) || 0) + todayUsd,
+    },
+    byService,
+  });
+});
+
+app.get("/admin/metrics/events", (req, res) => {
+  if (!requireAdmin(req, res)) return;
+
+  const limit = Math.max(1, Math.min(Number(req.query.limit) || 200, 2000));
+  const provider = String(req.query.provider || "").trim().toLowerCase();
+  const billingOwnerId = String(req.query.billingOwnerId || "").trim();
+
+  const where = [];
+  const params = { lim: limit };
+
+  if (billingOwnerId) {
+    where.push("billingOwnerId = @billingOwnerId");
+    params.billingOwnerId = billingOwnerId;
+  }
+  if (provider) {
+    where.push("provider = @provider");
+    params.provider = provider;
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const rows = usageDb.prepare(`
+    SELECT *
+    FROM usage_events
+    ${whereSql}
+    ORDER BY ts DESC
+    LIMIT @lim
+  `).all(params);
+
+  res.json({
+    count: rows.length,
+    items: rows.map(r => ({ ...r, metadata: r.metadataJson ? JSON.parse(r.metadataJson) : {} })),
+  });
+});
+
+
 
 // ============================================================================
 //  USAGE EVENTS STORAGE (SQLite) - designed for easy Postgres migration
