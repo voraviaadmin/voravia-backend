@@ -2,6 +2,13 @@
 .env
 .env.*
 
+# local db / data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+
 # Node
 node_modules/
 uploads/
