@@ -120,6 +120,46 @@ function sha256(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
 
+function computeOpenAICostUsdFromUsage({ model, usage }) {
+  // Pricing: Standard rates per 1M tokens
+  // Source: OpenAI pricing tables (gpt-4.1-mini) :contentReference[oaicite:2]{index=2}
+  const RATES_PER_1M = {
+    "gpt-4.1-mini": { input: 0.80, output: 3.20 },
+    // If you later switch to dated model IDs, you can add:
+    // "gpt-4.1-mini-2025-04-14": { input: 0.80, output: 3.20 },
+  };
+
+  const rates =
+    RATES_PER_1M[model] ||
+    (String(model).startsWith("gpt-4.1-mini") ? RATES_PER_1M["gpt-4.1-mini"] : null);
+
+  if (!rates) return { costUsd: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+
+  const inputTokens = Number(usage?.input_tokens ?? usage?.inputTokens ?? 0) || 0;
+  const outputTokens = Number(usage?.output_tokens ?? usage?.outputTokens ?? 0) || 0;
+  const totalTokens =
+    Number(usage?.total_tokens ?? usage?.totalTokens ?? (inputTokens + outputTokens)) || 0;
+
+  const costUsd =
+    (inputTokens * rates.input) / 1_000_000 + (outputTokens * rates.output) / 1_000_000;
+
+  // round to 6 decimals so small values show up but stay stable
+  const rounded = Math.round(costUsd * 1e6) / 1e6;
+
+  return { costUsd: rounded, inputTokens, outputTokens, totalTokens };
+}
+
+
+
+function requireAdmin(req, res) {
+  const token = String(req.header("x-admin-token") || "");
+  if (!process.env.ADMIN_TOKEN || token !== process.env.ADMIN_TOKEN) {
+    res.status(401).json({ error: "unauthorized" });
+    return false;
+  }
+  return true;
+}
+
 
 // ============================================================================
 //  USAGE EVENTS STORAGE (SQLite) - designed for easy Postgres migration
@@ -168,6 +208,110 @@ usageDb.exec(`
   CREATE INDEX IF NOT EXISTS idx_usage_events_subject_ts
     ON usage_events(subjectUserId, ts);
 `);
+
+
+// ============================================================================
+//  DAILY ROLLUPS (SQLite) - fast queries for dashboards
+// ============================================================================
+
+usageDb.exec(`
+  CREATE TABLE IF NOT EXISTS daily_usage_rollups (
+    day TEXT NOT NULL,              -- YYYY-MM-DD (UTC)
+    billingOwnerId TEXT,
+    actorUserId TEXT,
+    subjectUserId TEXT,
+    provider TEXT NOT NULL,
+    service TEXT NOT NULL,
+
+    events INTEGER NOT NULL,
+    units INTEGER NOT NULL,
+    costUsd REAL NOT NULL,
+
+    PRIMARY KEY (day, billingOwnerId, actorUserId, subjectUserId, provider, service)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_rollups_day
+    ON daily_usage_rollups(day);
+
+  CREATE INDEX IF NOT EXISTS idx_rollups_owner_day
+    ON daily_usage_rollups(billingOwnerId, day);
+
+  CREATE INDEX IF NOT EXISTS idx_rollups_actor_day
+    ON daily_usage_rollups(actorUserId, day);
+
+  CREATE INDEX IF NOT EXISTS idx_rollups_subject_day
+    ON daily_usage_rollups(subjectUserId, day);
+`);
+
+function isoDayUtc(d) {
+  const dt = d instanceof Date ? d : new Date(d);
+  return dt.toISOString().slice(0, 10); // YYYY-MM-DD in UTC
+}
+
+function dayRangeUtc(dayStr) {
+  // dayStr: YYYY-MM-DD
+  const start = new Date(`${dayStr}T00:00:00.000Z`);
+  const end = new Date(`${dayStr}T00:00:00.000Z`);
+  end.setUTCDate(end.getUTCDate() + 1);
+  return { startIso: start.toISOString(), endIso: end.toISOString() };
+}
+
+const rollupSelectStmt = usageDb.prepare(`
+  SELECT
+    @day AS day,
+    billingOwnerId,
+    actorUserId,
+    subjectUserId,
+    provider,
+    service,
+    COUNT(*) AS events,
+    SUM(units) AS units,
+    SUM(costUsd) AS costUsd
+  FROM usage_events
+  WHERE ts >= @startIso AND ts < @endIso
+  GROUP BY billingOwnerId, actorUserId, subjectUserId, provider, service
+`);
+
+const rollupUpsertStmt = usageDb.prepare(`
+  INSERT OR REPLACE INTO daily_usage_rollups (
+    day, billingOwnerId, actorUserId, subjectUserId, provider, service,
+    events, units, costUsd
+  ) VALUES (
+    @day, @billingOwnerId, @actorUserId, @subjectUserId, @provider, @service,
+    @events, @units, @costUsd
+  )
+`);
+
+function runDailyRollup(dayStr) {
+  const day = dayStr || isoDayUtc(new Date(Date.now() - 24 * 3600 * 1000)); // default: yesterday
+  const { startIso, endIso } = dayRangeUtc(day);
+
+  const rows = rollupSelectStmt.all({ day, startIso, endIso });
+
+  const tx = usageDb.transaction((items) => {
+    // Clear existing rollups for that day so reruns are correct
+    usageDb.prepare(`DELETE FROM daily_usage_rollups WHERE day = ?`).run(day);
+
+    for (const r of items) {
+      rollupUpsertStmt.run({
+        day: r.day,
+        billingOwnerId: r.billingOwnerId || null,
+        actorUserId: r.actorUserId || null,
+        subjectUserId: r.subjectUserId || null,
+        provider: r.provider,
+        service: r.service,
+        events: Number(r.events) || 0,
+        units: Number(r.units) || 0,
+        costUsd: Number(r.costUsd) || 0,
+      });
+    }
+  });
+
+  tx(rows);
+
+  return { day, rows: rows.length };
+}
+
 
 
 const usageInsertStmt = usageDb.prepare(`
@@ -227,6 +371,7 @@ const usageStore = {
       `
       )
       .all(params);
+      
 
     // Parse metadata JSON on the way out
     return rows.map((r) => ({
@@ -234,6 +379,93 @@ const usageStore = {
       metadata: r.metadataJson ? JSON.parse(r.metadataJson) : {},
     }));
   },
+
+  sumRange({ billingOwnerId, provider, startTs, endTs } = {}) {
+    const where = ["billingOwnerId = @billingOwnerId", "ts >= @startTs", "ts < @endTs"];
+    const params = {
+      billingOwnerId: String(billingOwnerId),
+      startTs: String(startTs),
+      endTs: String(endTs),
+    };
+
+    if (provider && provider !== "all") {
+      where.push("provider = @provider");
+      params.provider = String(provider);
+    }
+
+    const row = usageDb
+      .prepare(
+        `
+        SELECT COALESCE(SUM(costUsd), 0) AS c
+        FROM usage_events
+        WHERE ${where.join(" AND ")}
+      `
+      )
+      .get(params);
+
+    return Number(row?.c) || 0;
+  },
+
+  sumRangeBySubject({ billingOwnerId, provider, startTs, endTs } = {}) {
+    const where = ["billingOwnerId = @billingOwnerId", "ts >= @startTs", "ts < @endTs"];
+    const params = {
+      billingOwnerId: String(billingOwnerId),
+      startTs: String(startTs),
+      endTs: String(endTs),
+    };
+
+    if (provider && provider !== "all") {
+      where.push("provider = @provider");
+      params.provider = String(provider);
+    }
+
+    return usageDb
+      .prepare(
+        `
+        SELECT subjectUserId, COALESCE(SUM(costUsd), 0) AS costUsd
+        FROM usage_events
+        WHERE ${where.join(" AND ")}
+        GROUP BY subjectUserId
+        ORDER BY costUsd DESC
+      `
+      )
+      .all(params)
+      .map((r) => ({ subjectUserId: r.subjectUserId || "unknown", costUsd: Number(r.costUsd) || 0 }));
+  },
+
+  sumRangeByService({ billingOwnerId, provider, startTs, endTs } = {}) {
+    const where = ["billingOwnerId = @billingOwnerId", "ts >= @startTs", "ts < @endTs"];
+    const params = {
+      billingOwnerId: String(billingOwnerId),
+      startTs: String(startTs),
+      endTs: String(endTs),
+    };
+
+    if (provider && provider !== "all") {
+      where.push("provider = @provider");
+      params.provider = String(provider);
+    }
+
+    return usageDb
+      .prepare(
+        `
+        SELECT provider, service, COALESCE(SUM(costUsd), 0) AS costUsd, COALESCE(COUNT(1), 0) AS events
+        FROM usage_events
+        WHERE ${where.join(" AND ")}
+        GROUP BY provider, service
+        ORDER BY costUsd DESC
+      `
+      )
+      .all(params)
+      .map((r) => ({
+        provider: String(r.provider || ""),
+        service: String(r.service || ""),
+        costUsd: Number(r.costUsd) || 0,
+        events: Number(r.events) || 0,
+      }));
+  },
+
+
 };
 
 
@@ -486,6 +718,159 @@ app.get("/v1/usage/by-member", (req, res) => {
     provider: provider || null,
     totalsBySubject,
   });
+});
+
+
+// ============================================================================
+//  GROUP USAGE (user-facing)
+//  GET /v1/group-usage?days=30&provider=all|google|openai
+// ============================================================================
+app.get("/v1/group-usage", (req, res) => {
+  try {
+    const me = req.ctx?.me || null;
+
+    // Prefer ctx if present
+    let billingOwnerId = String(req.ctx?.billingOwnerId || "").trim();
+    
+    // Fallbacks:
+    // - Family: bill to head user (or family owner id if you store it)
+    // - Individual: bill to self
+    if (!billingOwnerId) {
+      const mode = me?.mode || null;
+    
+      if (mode === "family") {
+        // If your /v1/me returns family.headUserId, prefer that.
+        billingOwnerId = String(me?.family?.headUserId || me?.family?.ownerUserId || "").trim();
+      }
+    
+      if (!billingOwnerId) {
+        // Individual (or unknown): bill to current user
+        billingOwnerId = String(req.ctx?.userId || me?.id || "").trim();
+      }
+    }
+    
+    if (!billingOwnerId) {
+      return res.status(400).json({ error: "missing_billing_owner" });
+    }
+    
+
+    const days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
+    const provider = String(req.query.provider || "all").trim().toLowerCase();
+
+    const start = new Date();
+    start.setUTCDate(start.getUTCDate() - days);
+    const startDay = isoDayUtc(start);
+
+    const providerSql = provider === "all" ? "" : " AND provider = @provider ";
+
+    const totalCostUsd =
+      usageDb.prepare(`
+        SELECT COALESCE(SUM(costUsd), 0) AS c
+        FROM daily_usage_rollups
+        WHERE billingOwnerId = @billingOwnerId
+          AND day >= @startDay
+          ${providerSql}
+      `).get({ billingOwnerId, startDay, provider })?.c ?? 0;
+
+    const bySubjectRows = usageDb.prepare(`
+      SELECT subjectUserId, COALESCE(SUM(costUsd), 0) AS costUsd
+      FROM daily_usage_rollups
+      WHERE billingOwnerId = @billingOwnerId
+        AND day >= @startDay
+        ${providerSql}
+      GROUP BY subjectUserId
+      ORDER BY costUsd DESC
+    `).all({ billingOwnerId, startDay, provider });
+
+    const bySubjectUserId = {};
+    for (const r of bySubjectRows) {
+      bySubjectUserId[r.subjectUserId || "unknown"] = Number(r.costUsd) || 0;
+    }
+
+    const byService = usageDb.prepare(`
+      SELECT provider, service, COALESCE(SUM(costUsd), 0) AS costUsd, COALESCE(SUM(events), 0) AS events
+      FROM daily_usage_rollups
+      WHERE billingOwnerId = @billingOwnerId
+        AND day >= @startDay
+        ${providerSql}
+      GROUP BY provider, service
+      ORDER BY costUsd DESC
+    `).all({ billingOwnerId, startDay, provider });
+
+        // -----------------------------
+    // Option 1: Add "today so far" live events (not yet in rollups)
+    // -----------------------------
+    const now = new Date();
+    const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const todayStartTs = todayStart.toISOString();
+    const nowTs = now.toISOString();
+
+    const todaySoFarUsd = usageStore.sumRange({
+      billingOwnerId,
+      provider,
+      startTs: todayStartTs,
+      endTs: nowTs,
+    });
+
+    const todayBySubject = usageStore.sumRangeBySubject({
+      billingOwnerId,
+      provider,
+      startTs: todayStartTs,
+      endTs: nowTs,
+    });
+
+    const todayByService = usageStore.sumRangeByService({
+      billingOwnerId,
+      provider,
+      startTs: todayStartTs,
+      endTs: nowTs,
+    });
+
+    // Merge totals
+    const mergedTotalCostUsd = (Number(totalCostUsd) || 0) + (Number(todaySoFarUsd) || 0);
+
+    // Merge bySubjectUserId
+    for (const r of todayBySubject) {
+      const k = r.subjectUserId || "unknown";
+      bySubjectUserId[k] = (Number(bySubjectUserId[k]) || 0) + (Number(r.costUsd) || 0);
+    }
+
+    // Merge byService
+    const svcKey = (p, s) => `${p}::${s}`;
+    const svcMap = new Map();
+    for (const row of byService) {
+      svcMap.set(svcKey(row.provider, row.service), {
+        provider: row.provider,
+        service: row.service,
+        costUsd: Number(row.costUsd) || 0,
+        events: Number(row.events) || 0,
+      });
+    }
+    for (const row of todayByService) {
+      const k = svcKey(row.provider, row.service);
+      const prev = svcMap.get(k) || { provider: row.provider, service: row.service, costUsd: 0, events: 0 };
+      prev.costUsd += Number(row.costUsd) || 0;
+      prev.events += Number(row.events) || 0;
+      svcMap.set(k, prev);
+    }
+    const mergedByService = Array.from(svcMap.values()).sort((a, b) => (b.costUsd || 0) - (a.costUsd || 0));
+
+
+    res.json({
+      mode: me?.mode ?? null,
+      billingOwnerId,
+      days,
+      provider,
+      totalCostUsd: Number(mergedTotalCostUsd) || 0,
+      todaySoFarUsd: Number(todaySoFarUsd) || 0,
+      todayStartTs,
+      bySubjectUserId,
+      byService: mergedByService,
+    });
+  } catch (err) {
+    console.error("group-usage error:", err);
+    res.status(500).json({ error: "group_usage_error" });
+  }
 });
 
 
@@ -1227,15 +1612,32 @@ app.get("/v1/home-recommendations", (req, res) => {
       source: "openai",
     };
 
+    const model = "gpt-4.1-mini";
+
+    // Compute real cost from returned usage tokens
+    const { costUsd, inputTokens, outputTokens, totalTokens } =
+      computeOpenAICostUsdFromUsage({ model, usage: response?.usage });
+    
     emitUsageEvent(req, {
       provider: "openai",
       service: "openai_scan_vision",
       subjectUserId: memberId,
+    
+      // Keep "units" as 1 scan call, but now the unit cost is calculated
       units: 1,
-      unitCostUsd: PRICING.openai_scan_vision,
-      costUsd: PRICING.openai_scan_vision,
-      metadata: { cached: false, model: "gpt-4.1-mini", memberId },
+      unitCostUsd: costUsd,
+      costUsd,
+    
+      metadata: {
+        cached: false,
+        model,
+        memberId,
+        inputTokens,
+        outputTokens,
+        totalTokens,
+      },
     });
+    
     
 
 
@@ -1699,6 +2101,29 @@ app.post("/api/menu/rate", async (req, res) => {
     res.status(500).json({ error: "menu_rate_error", message: err?.message });
   }
 });
+
+
+// Run rollup for yesterday on startup (fast) and every hour (cheap)
+try {
+  const r = runDailyRollup(); // yesterday
+  console.log("[rollup] computed:", r);
+} catch (e) {
+  console.warn("[rollup] startup rollup failed:", e?.message || e);
+}
+
+setInterval(() => {
+  try {
+    const r = runDailyRollup(); // yesterday
+    console.log("[rollup] computed:", r);
+  } catch (e) {
+    console.warn("[rollup] scheduled rollup failed:", e?.message || e);
+  }
+}, 60 * 60 * 1000);
+
+
+
+
+
 
 app.listen(port, () => {
   console.log(`✅ Voravia backend running on port ${port}`);
