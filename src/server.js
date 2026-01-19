@@ -11,14 +11,93 @@ import "dotenv/config";
 
 import crypto from "crypto";
 import NodeCache from "node-cache";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import Database from "better-sqlite3";
 
 const app = express();
 const port = process.env.PORT || 8787;
 
 console.log("OPENAI KEY LOADED:", !!process.env.OPENAI_API_KEY);
 
-app.use(cors({ origin: true }));
-app.use(express.json({ limit: "2mb" }));
+//app.use(cors({ origin: true }));
+//app.use(express.json({ limit: "2mb" }));
+
+
+// ----------------------------------------------------------------------------
+//  SECURITY + COMPLIANCE BASELINE MIDDLEWARE (MVP-SAFE)
+// ----------------------------------------------------------------------------
+// 1) Security headers (safe defaults; relax later if needed)
+app.use(
+    helmet({
+      // Keep default protections; explicitly disable CSP for MVP since you serve API only.
+      contentSecurityPolicy: false,
+    })
+  );
+  
+  // 2) CORS (leave permissive for dev; tighten in prod via env)
+  const corsOrigin =
+    process.env.CORS_ORIGIN && process.env.CORS_ORIGIN !== "*"
+      ? process.env.CORS_ORIGIN.split(",").map((s) => s.trim())
+      : true;
+  app.use(cors({ origin: corsOrigin }));
+  
+  // 3) Body limit
+  app.use(express.json({ limit: "2mb" }));
+  
+  // 4) Request ID + minimal audit log
+  app.use((req, res, next) => {
+    const rid =
+      String(req.header("x-request-id") || "").trim() || crypto.randomUUID();
+    req.requestId = rid;
+    res.setHeader("x-request-id", rid);
+  
+    const start = Date.now();
+    res.on("finish", () => {
+      // Avoid logging sensitive bodies; log only metadata
+      const ms = Date.now() - start;
+      //const uid = String(req.header("x-user-id") || req.query.userId || "");
+      const uid = String(req.ctx?.userId || req.header("x-user-id") || req.query.userId || "");
+
+      console.log(
+        JSON.stringify({
+          t: new Date().toISOString(),
+          rid,
+          m: req.method,
+          p: req.path,
+          s: res.statusCode,
+          ms,
+          uid: uid || undefined,
+        })
+      );
+    });
+  
+    next();
+  });
+  
+  // 5) Rate limiting (cost guardrails)
+  // Default: 120 req / minute per IP. Tighten for expensive endpoints below.
+  app.use(
+    rateLimit({
+      windowMs: 60 * 1000,
+      limit: Number(process.env.RATE_LIMIT_PER_MIN || 120),
+      standardHeaders: "draft-7",
+      legacyHeaders: false,
+    })
+  );
+  
+  // Per-route stricter limits for expensive endpoints (Google + OpenAI)
+  const costlyLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: Number(process.env.COSTLY_RATE_LIMIT_PER_MIN || 30),
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+  });
+
+
+
+
+
 
 // ---------- OpenAI Client ----------
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -40,6 +119,181 @@ const cache = new NodeCache({
 function sha256(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
+
+
+// ============================================================================
+//  USAGE EVENTS STORAGE (SQLite) - designed for easy Postgres migration
+// ============================================================================
+
+
+
+// Keep DB path configurable; default to local file
+const USAGE_DB_PATH = process.env.USAGE_DB_PATH || "./data/usage.db";
+const usageDb = new Database(USAGE_DB_PATH);
+
+// Recommended pragmas for single-instance service
+usageDb.pragma("journal_mode = WAL");
+usageDb.pragma("synchronous = NORMAL");
+usageDb.pragma("foreign_keys = ON");
+usageDb.pragma("busy_timeout = 5000");
+
+// Create table (portable schema: works in Postgres with minimal changes)
+usageDb.exec(`
+  CREATE TABLE IF NOT EXISTS usage_events (
+    id TEXT PRIMARY KEY,
+    ts TEXT NOT NULL,
+    requestId TEXT,
+    actorUserId TEXT,
+    billingOwnerId TEXT,
+    subjectUserId TEXT,  -- ✅ NEW
+    mode TEXT,
+    provider TEXT NOT NULL,
+    service TEXT NOT NULL,
+    units INTEGER NOT NULL,
+    unitCostUsd REAL NOT NULL,
+    costUsd REAL NOT NULL,
+    metadataJson TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_usage_events_ts
+    ON usage_events(ts);
+
+  CREATE INDEX IF NOT EXISTS idx_usage_events_billingOwner_ts
+    ON usage_events(billingOwnerId, ts);
+
+  CREATE INDEX IF NOT EXISTS idx_usage_events_provider_service_ts
+    ON usage_events(provider, service, ts);
+
+  -- ✅ NEW: helps per-member views
+  CREATE INDEX IF NOT EXISTS idx_usage_events_subject_ts
+    ON usage_events(subjectUserId, ts);
+`);
+
+
+const usageInsertStmt = usageDb.prepare(`
+  INSERT INTO usage_events (
+    id, ts, requestId, actorUserId, billingOwnerId, subjectUserId, mode,
+    provider, service, units, unitCostUsd, costUsd, metadataJson
+  ) VALUES (
+    @id, @ts, @requestId, @actorUserId, @billingOwnerId, @subjectUserId, @mode,
+    @provider, @service, @units, @unitCostUsd, @costUsd, @metadataJson
+  )
+`);
+
+
+function makeUsageId() {
+  return `ue_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+/**
+ * UsageStore interface:
+ * - insert(event)
+ * - query({ billingOwnerId?, provider?, limit? })
+ *
+ * Keep this interface stable and Postgres migration is trivial.
+ */
+const usageStore = {
+  insert(evt) {
+    usageInsertStmt.run(evt);
+    return evt;
+  },
+
+  query({ billingOwnerId, provider, limit = 200 } = {}) {
+    const lim = Math.max(1, Math.min(Number(limit) || 200, 1000));
+
+    // Build a small dynamic WHERE clause (portable SQL)
+    const where = [];
+    const params = { lim };
+
+    if (billingOwnerId) {
+      where.push("billingOwnerId = @billingOwnerId");
+      params.billingOwnerId = String(billingOwnerId);
+    }
+    if (provider) {
+      where.push("provider = @provider");
+      params.provider = String(provider);
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const rows = usageDb
+      .prepare(
+        `
+        SELECT *
+        FROM usage_events
+        ${whereSql}
+        ORDER BY ts DESC
+        LIMIT @lim
+      `
+      )
+      .all(params);
+
+    // Parse metadata JSON on the way out
+    return rows.map((r) => ({
+      ...r,
+      metadata: r.metadataJson ? JSON.parse(r.metadataJson) : {},
+    }));
+  },
+};
+
+
+
+// ============================================================================
+//  USAGE + COST LEDGER (MVP: in-memory)
+//  - Tracks per-service cost for Google Places + OpenAI
+//  - Later you can move this to a DB table without changing call sites
+// ============================================================================
+
+// Per-request USD costs (set via env). Start with 0 until you confirm pricing.
+const PRICING = {
+  google_places_searchNearby: Number(process.env.COST_GOOGLE_NEARBY_USD || 0),
+  google_places_searchText: Number(process.env.COST_GOOGLE_TEXT_USD || 0),
+
+  // Optional placeholders (you can switch to token-based later)
+  openai_scan_vision: Number(process.env.COST_OPENAI_SCAN_USD || 0),
+};
+
+function safeNumber(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function emitUsageEvent(req, evt) {
+  const record = {
+    id: makeUsageId(),
+    ts: new Date().toISOString(),
+
+    requestId: req?.requestId || null,
+    actorUserId: req?.ctx?.userId || null,
+    billingOwnerId: req?.ctx?.billingOwnerId || null,
+    subjectUserId: evt?.subjectUserId ? String(evt.subjectUserId) : null,
+    mode: req?.ctx?.me?.mode || null,
+
+    provider: String(evt.provider),
+    service: String(evt.service),
+    units: Math.trunc(safeNumber(evt.units ?? 0)),
+    unitCostUsd: safeNumber(evt.unitCostUsd ?? 0),
+    costUsd: safeNumber(evt.costUsd ?? 0),
+    metadataJson: JSON.stringify(evt.metadata || {}),
+  };
+
+  usageStore.insert(record);
+  return { ...record, metadata: evt.metadata || {} };
+}
+
+
+
+// ---------------------------------------------------------------------------
+//  Request Context (Identity + Scope) - minimal compliance risk
+// ---------------------------------------------------------------------------
+// We keep your MVP identity method (x-user-id / query userId) but centralize it.
+// Later you can replace this with real auth without touching route handlers.
+app.use((req, _res, next) => {
+  req.ctx = req.ctx || {};
+  req.ctx.userId = String(req.header("x-user-id") || req.query.userId || "u_head").trim();
+  next();
+});
+
 
 function stableJsonKey(obj) {
   const keys = Object.keys(obj || {}).sort();
@@ -180,6 +434,63 @@ function mergeProfile(userProfile, memberPrefs) {
 // ---------- HEALTH CHECK ----------
 app.get("/health", (_, res) => res.json({ ok: true }));
 
+
+// ---------- USAGE (MVP: read-only) ----------
+app.get("/v1/usage", (req, res) => {
+  const billingOwnerId = String(req.query.billingOwnerId || "").trim();
+  const provider = String(req.query.provider || "").trim();
+  const limit = Number(req.query.limit || 200);
+
+  const items = usageStore.query({
+    billingOwnerId: billingOwnerId || undefined,
+    provider: provider || undefined,
+    limit,
+  });
+
+  // Totals for convenience (last N returned)
+  const totals = {};
+  for (const e of items) {
+    const k = `${e.provider}:${e.service}`;
+    totals[k] = (totals[k] || 0) + safeNumber(e.costUsd);
+  }
+
+  res.json({
+    count: items.length,
+    lastN: items,
+    totalsLastN: totals,
+  });
+});
+
+
+app.get("/v1/usage/by-member", (req, res) => {
+  const billingOwnerId = String(
+    req.query.billingOwnerId || req.ctx?.billingOwnerId || "u_head"
+  ).trim();
+  
+  const provider = String(req.query.provider || "").trim();
+
+  const items = usageStore.query({
+    billingOwnerId: billingOwnerId || undefined,
+    provider: provider || undefined,
+    limit: 1000,
+  });
+
+  const totalsBySubject = {};
+  for (const e of items) {
+    const k = e.subjectUserId || "unknown";
+    totalsBySubject[k] = (totalsBySubject[k] || 0) + safeNumber(e.costUsd);
+  }
+
+  res.json({
+    billingOwnerId: billingOwnerId || null,
+    provider: provider || null,
+    totalsBySubject,
+  });
+});
+
+
+
+
 // ============================================================================
 //  MVP "ME" + FAMILY (profile-aware)
 // ============================================================================
@@ -232,7 +543,8 @@ function ensureMeState(userId) {
 
 
 function buildMe(req) {
-  const userId = getUserId(req);
+  //const userId = getUserId(req);
+  const userId = req?.ctx?.userId ? String(req.ctx.userId) : getUserId(req);
 
   const state = ensureMeState(userId);
   const overrideMode = resolveMode(req);
@@ -278,6 +590,24 @@ app.get("/v1/me", (req, res) => {
   res.json(buildMe(req));
 });
 
+
+
+// Build /v1/me context once per request for downstream routes
+app.use((req, _res, next) => {
+  try {
+    req.ctx = req.ctx || {};
+    req.ctx.me = buildMe(req);
+
+    // Billing owner: for now family rolls up to u_head; later replace with real owner id.
+    req.ctx.billingOwnerId =
+      req.ctx.me?.mode === "family" ? "u_head" : String(req.ctx.me?.userId || req.ctx.userId);
+  } catch {
+    req.ctx = req.ctx || {};
+    req.ctx.me = null;
+    req.ctx.billingOwnerId = req.ctx.userId;
+  }
+  next();
+});
 
 // PATCH /v1/me
 // Body examples:
@@ -775,9 +1105,14 @@ app.get("/v1/home-recommendations", (req, res) => {
 // ============================================================================
 //  SCAN (vision) – /v1/scans
 // ============================================================================
-app.post("/v1/scans", upload.single("image"), async (req, res) => {
+//app.post("/v1/scans", upload.single("image"), async (req, res) => {
+  app.post("/v1/scans", costlyLimiter, upload.single("image"), async (req, res) => {
 
-  const memberId = String(req.query.memberId || "").trim() || "u_self";
+  //const memberId = String(req.query.memberId || "").trim() || "u_self";
+  const memberId = String(getMemberIdForScan(req) || "u_self");
+
+
+
   const memberPrefs = (MEMBER_PREFERENCES && MEMBER_PREFERENCES[memberId]) || {};
   let profile = {};
   let effectiveProfile = {};
@@ -811,7 +1146,20 @@ app.post("/v1/scans", upload.single("image"), async (req, res) => {
     )}`;
 
     const cached = cache.get(cacheKey);
-    if (cached) return res.json({ ...cached, cached: true });
+      if (cached) {
+        // Cached call -> cost is effectively 0
+        emitUsageEvent(req, {
+          provider: "openai",
+          service: "openai_scan_vision",
+          subjectUserId: memberId,
+          units: 0,
+          unitCostUsd: 0,
+          costUsd: 0,
+          metadata: { cached: true, memberId },
+        });
+        return res.json({ ...cached, cached: true });
+      }
+
 
     const instruction =
       `Return ONLY valid JSON (no markdown). Schema:\n` +
@@ -879,6 +1227,18 @@ app.post("/v1/scans", upload.single("image"), async (req, res) => {
       source: "openai",
     };
 
+    emitUsageEvent(req, {
+      provider: "openai",
+      service: "openai_scan_vision",
+      subjectUserId: memberId,
+      units: 1,
+      unitCostUsd: PRICING.openai_scan_vision,
+      costUsd: PRICING.openai_scan_vision,
+      metadata: { cached: false, model: "gpt-4.1-mini", memberId },
+    });
+    
+
+
     cache.set(cacheKey, payload);
     return res.json(payload);
   } catch (err) {
@@ -910,10 +1270,19 @@ function normalizePlaces(json) {
 }
 
 // ---------- GOOGLE PLACES ----------
-app.get("/api/places/nearby", async (req, res) => {
+// JV Removed code on 01/18 - Google search duplicacy
+
+async function handlePlacesNearby(req, res) {
   try {
-    const lat = Number(req.query.lat);
-    const lng = Number(req.query.lng);
+
+
+    if (req.method === "POST" && !req.is("application/json")) {
+      return res.status(415).json({ error: "Expected application/json" });
+    }
+
+    // Support both GET query params and POST JSON body
+    const lat = Number(req.query.lat ?? req.body?.lat);
+    const lng = Number(req.query.lng ?? req.body?.lng);
 
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
       return res.status(400).json({ error: "Invalid lat/lng" });
@@ -922,8 +1291,8 @@ app.get("/api/places/nearby", async (req, res) => {
     const apiKey = process.env.GOOGLE_MAPS_API_KEY;
     if (!apiKey) return res.status(500).json({ error: "Missing GOOGLE_MAPS_API_KEY" });
 
-    const radiusMeters = clampInt(req.query.radiusMeters ?? 2500, 100, 50000, 2500);
-    const maxResultCount = clampInt(req.query.limit ?? 20, 1, 20, 20);
+    const radiusMeters = clampInt(req.query.radiusMeters ?? req.body?.radiusMeters ?? 2500, 100, 50000, 2500);
+    const maxResultCount = clampInt(req.query.limit ?? req.body?.limit ?? 20, 1, 20, 20);
 
     const url = "https://places.googleapis.com/v1/places:searchNearby";
     const body = {
@@ -953,18 +1322,36 @@ app.get("/api/places/nearby", async (req, res) => {
       });
     }
 
-    res.json({ places: normalizePlaces(json) });
+    // Meter it (only after success)
+    emitUsageEvent(req, {
+      provider: "google",
+      service: "google_places_searchNearby",
+      subjectUserId: req.ctx?.userId,     
+      units: 1,
+      unitCostUsd: PRICING.google_places_searchNearby,
+      costUsd: PRICING.google_places_searchNearby,
+      metadata: { radiusMeters, maxResultCount },
+    });
+
+    return res.json({ places: normalizePlaces(json) });
   } catch (err) {
     console.error("Places nearby error:", err);
-    res.status(500).json({ error: "places_error", message: err?.message });
+    return res.status(500).json({ error: "places_error", message: err?.message });
   }
-});
+}
 
-app.get("/api/places/search", async (req, res) => {
+async function handlePlacesSearch(req, res) {
+  
   try {
-    const lat = Number(req.query.lat);
-    const lng = Number(req.query.lng);
-    const q = String(req.query.q ?? "").trim();
+    
+    if (req.method === "POST" && !req.is("application/json")) {
+      return res.status(415).json({ error: "Expected application/json" });
+    }
+
+    // Support both GET query params and POST JSON body
+    const lat = Number(req.query.lat ?? req.body?.lat);
+    const lng = Number(req.query.lng ?? req.body?.lng);
+    const q = String(req.query.q ?? req.body?.q ?? "").trim();
 
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
       return res.status(400).json({ error: "Invalid lat/lng" });
@@ -974,8 +1361,8 @@ app.get("/api/places/search", async (req, res) => {
     const apiKey = process.env.GOOGLE_MAPS_API_KEY;
     if (!apiKey) return res.status(500).json({ error: "Missing GOOGLE_MAPS_API_KEY" });
 
-    const radiusMeters = clampInt(req.query.radiusMeters ?? 5000, 100, 50000, 5000);
-    const maxResultCount = clampInt(req.query.limit ?? 20, 1, 20, 20);
+    const radiusMeters = clampInt(req.query.radiusMeters ?? req.body?.radiusMeters ?? 5000, 100, 50000, 5000);
+    const maxResultCount = clampInt(req.query.limit ?? req.body?.limit ?? 20, 1, 20, 20);
 
     const url = "https://places.googleapis.com/v1/places:searchText";
     const body = {
@@ -1005,12 +1392,32 @@ app.get("/api/places/search", async (req, res) => {
       });
     }
 
-    res.json({ places: normalizePlaces(json) });
+    // Meter it (only after success)
+    emitUsageEvent(req, {
+      provider: "google",
+      service: "google_places_searchText",
+      subjectUserId: req.ctx?.userId,    
+      units: 1,
+      unitCostUsd: PRICING.google_places_searchText,
+      costUsd: PRICING.google_places_searchText,
+      metadata: { q, radiusMeters, maxResultCount },
+    });
+
+    return res.json({ places: normalizePlaces(json) });
   } catch (err) {
     console.error("Places search error:", err);
-    res.status(500).json({ error: "search_error", message: err?.message });
+    return res.status(500).json({ error: "search_error", message: err?.message });
   }
-});
+}
+
+
+app.get("/api/places/nearby", costlyLimiter, handlePlacesNearby);
+app.post("/api/places/nearby", costlyLimiter, handlePlacesNearby);
+
+app.get("/api/places/search", costlyLimiter, handlePlacesSearch);
+app.post("/api/places/search", costlyLimiter, handlePlacesSearch);
+
+
 
 // ---------- PDF text extraction (pdfjs-dist) ----------
 async function extractTextFromPdfBuffer(buffer) {
@@ -1295,4 +1702,19 @@ app.post("/api/menu/rate", async (req, res) => {
 
 app.listen(port, () => {
   console.log(`✅ Voravia backend running on port ${port}`);
+});
+
+
+
+// ---------------------------------------------------------------------------
+//  Central Error Handler (keep last)
+// ---------------------------------------------------------------------------
+// If you throw errors later (e.g. authz), they’ll land here consistently.
+app.use((err, req, res, _next) => {
+  const rid = req?.requestId;
+  console.error("Unhandled error", { rid, message: err?.message, stack: err?.stack });
+
+  const status = Number(err?.statusCode || err?.status || 500);
+  const safeMsg = status >= 500 ? "internal_error" : (err?.message || "request_error");
+  res.status(status).json({ error: safeMsg, requestId: rid });
 });
