@@ -14,6 +14,8 @@ import NodeCache from "node-cache";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import Database from "better-sqlite3";
+import { requireAdminSession, handleAdminLogin } from "./adminAuth.mjs";
+
 
 const app = express();
 const port = process.env.PORT || 8787;
@@ -44,6 +46,17 @@ app.use(
   
   // 3) Body limit
   app.use(express.json({ limit: "2mb" }));
+
+  // Admin auth
+app.post("/admin/auth/login", handleAdminLogin);
+
+
+// Protect /admin/metrics/*
+app.use(
+  "/admin/metrics",
+  requireAdminSession({ allowDevHeaderToken: true }) // set false in prod
+);
+
   
   // 4) Request ID + minimal audit log
   app.use((req, res, next) => {
@@ -160,111 +173,317 @@ function requireAdmin(req, res) {
   return true;
 }
 
+
+function getSubjectUserId(req, ctx) {
+  const h = req.headers || {};
+  const headerSub = String(h["x-subject-user-id"] || "").trim();
+  if (headerSub) return headerSub;
+
+  const qSub = String(req.query?.subjectUserId || "").trim();
+  if (qSub) return qSub;
+
+  const bSub = String(req.body?.subjectUserId || "").trim();
+  if (bSub) return bSub;
+
+  // fallback = caller user
+  return String(ctx?.me?.userId || ctx?.userId || h["x-user-id"] || "").trim();
+}
+
+
 // ============================================================================
 //  ADMIN METRICS (app owner)
 //  - Protected by x-admin-token === process.env.ADMIN_TOKEN
 // ============================================================================
 
-app.get("/admin/metrics/summary", (req, res) => {
-  if (!requireAdmin(req, res)) return;
 
+// 1) login route
+app.post("/admin/auth/login", handleAdminLogin);
+
+// 2) protect admin metrics
+// If your admin routes are mounted under /admin already, wrap them:
+// Example:
+app.use(
+  "/admin/metrics",
+  requireAdminSession({ allowDevHeaderToken: true }) // set false later in prod
+);
+
+app.get("/admin/metrics/summary", (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
+    const provider = String(req.query.provider || "all").trim().toLowerCase();
+
+    const start = new Date();
+    start.setUTCDate(start.getUTCDate() - (days - 1));
+    const startDay = isoDayUtc(start);
+
+    const providerSql = provider === "all" ? "" : " AND provider = @provider ";
+
+    // Rollup totals (historical days)
+    const totalRollupUsd =
+      usageDb
+        .prepare(
+          `
+          SELECT COALESCE(SUM(costUsd), 0) AS c
+          FROM daily_usage_rollups
+          WHERE day >= @startDay
+          ${providerSql}
+        `
+        )
+        .get({ startDay, provider })?.c ?? 0;
+
+    // By-service breakdown from rollups
+    const byService = usageDb
+      .prepare(
+        `
+        SELECT provider, service,
+               COALESCE(SUM(costUsd), 0) AS costUsd,
+               COALESCE(SUM(events), 0) AS events
+        FROM daily_usage_rollups
+        WHERE day >= @startDay
+        ${providerSql}
+        GROUP BY provider, service
+        ORDER BY costUsd DESC
+      `
+      )
+      .all({ startDay, provider })
+      .map((r) => ({
+        provider: String(r.provider || ""),
+        service: String(r.service || ""),
+        costUsd: Number(r.costUsd || 0),
+        events: Number(r.events || 0),
+      }));
+
+    // Today so far (live events)
+    const now = new Date();
+    const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const todayStartTs = todayStart.toISOString();
+    const nowTs = now.toISOString();
+
+    // cost (today events)
+    const todaySoFarUsd = usageDb
+      .prepare(
+        `
+        SELECT COALESCE(SUM(costUsd), 0) AS c
+        FROM usage_events
+        WHERE ts >= @startTs AND ts < @endTs
+        ${provider === "all" ? "" : " AND provider = @provider "}
+      `
+      )
+      .get({ startTs: todayStartTs, endTs: nowTs, provider })?.c ?? 0;
+
+    // total events (rollups + today)
+    const totalEventsRollup =
+      usageDb
+        .prepare(
+          `
+          SELECT COALESCE(SUM(events), 0) AS n
+          FROM daily_usage_rollups
+          WHERE day >= @startDay
+          ${providerSql}
+        `
+        )
+        .get({ startDay, provider })?.n ?? 0;
+
+    const todaySoFarEvents =
+      usageDb
+        .prepare(
+          `
+          SELECT COUNT(*) AS n
+          FROM usage_events
+          WHERE ts >= @startTs AND ts < @endTs
+          ${provider === "all" ? "" : " AND provider = @provider "}
+        `
+        )
+        .get({ startTs: todayStartTs, endTs: nowTs, provider })?.n ?? 0;
+
+    const totalUsd = Number(totalRollupUsd || 0) + Number(todaySoFarUsd || 0);
+
+    res.json({
+      windowDays: days,
+      provider,
+      startDay,
+      today: isoDayUtc(now),
+      todayStartTs: Date.parse(todayStartTs),
+      totalRollupUsd: Number(totalRollupUsd || 0),
+      todaySoFarUsd: Number(todaySoFarUsd || 0),
+      totalUsd: Number(totalUsd || 0),
+      totalEvents: Number(totalEventsRollup || 0) + Number(todaySoFarEvents || 0),
+      byService,
+    });
+  } catch (e) {
+    console.error("summary error:", e);
+    res.status(500).json({ error: "Failed to compute summary" });
+  }
+});
+
+
+
+app.get("/admin/metrics/cost-per-user", (req, res) => {
   const days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
   const provider = String(req.query.provider || "all").trim().toLowerCase();
 
   const start = new Date();
-  start.setUTCDate(start.getUTCDate() - days);
+  start.setUTCDate(start.getUTCDate() - (days - 1));
   const startDay = isoDayUtc(start);
 
   const providerSql = provider === "all" ? "" : " AND provider = @provider ";
 
-  // Rollup totals (historical days)
-  const totalRollupUsd =
-    usageDb.prepare(`
-      SELECT COALESCE(SUM(costUsd), 0) AS c
-      FROM daily_usage_rollups
-      WHERE day >= @startDay
-      ${providerSql}
-    `).get({ startDay, provider })?.c ?? 0;
+  try {
+    // Rollup totals
+    const row = usageDb
+      .prepare(
+        `
+        SELECT COALESCE(SUM(costUsd), 0) AS totalUsd
+        FROM daily_usage_rollups
+        WHERE day >= @startDay
+        ${providerSql}
+        `
+      )
+      .get({ startDay, provider });
 
-  // Today so far (live events, not in yesterday rollup)
-  const now = new Date();
-  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-  const todayStartTs = todayStart.toISOString();
-  const nowTs = now.toISOString();
+    const totalRollupUsd = Number(row?.totalUsd || 0);
 
-  const todaySoFarUsd = usageStore.sumRange({
-    billingOwnerId: "", // ignored by query builder if blank? we'll handle below
-    provider,
-    startTs: todayStartTs,
-    endTs: nowTs,
-  });
+    // Rollup active users (distinct subjectUserId)
+    const au = usageDb
+      .prepare(
+        `
+        SELECT COUNT(DISTINCT subjectUserId) AS activeUsers
+        FROM daily_usage_rollups
+        WHERE day >= @startDay
+          AND subjectUserId IS NOT NULL
+          AND subjectUserId <> ''
+        ${providerSql}
+        `
+      )
+      .get({ startDay, provider });
 
-  // If you want totals across ALL billing owners, we need a version that doesn't require billingOwnerId.
-  // Quick pragmatic approach: query DB directly for today:
-  const todayRow = usageDb.prepare(`
-    SELECT COALESCE(SUM(costUsd), 0) AS c
-    FROM usage_events
-    WHERE ts >= @startTs AND ts < @endTs
-    ${provider === "all" ? "" : " AND provider = @provider "}
-  `).get({ startTs: todayStartTs, endTs: nowTs, provider });
+    const activeUsersRollup = Number(au?.activeUsers || 0);
 
-  const todayUsd = Number(todayRow?.c) || 0;
+    // Today so far (live events)
+    const now = new Date();
+    const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const todayStartIso = todayStart.toISOString();
+    const nowIso = now.toISOString();
 
-  // Top services (rollups + today events)
-  const byServiceRollup = usageDb.prepare(`
-    SELECT provider, service, COALESCE(SUM(costUsd), 0) AS costUsd, COALESCE(SUM(events), 0) AS events
-    FROM daily_usage_rollups
-    WHERE day >= @startDay
-    ${providerSql}
-    GROUP BY provider, service
-    ORDER BY costUsd DESC
-    LIMIT 50
-  `).all({ startDay, provider });
-
-  const byServiceToday = usageDb.prepare(`
-    SELECT provider, service, COALESCE(SUM(costUsd), 0) AS costUsd, COALESCE(COUNT(1), 0) AS events
-    FROM usage_events
-    WHERE ts >= @startTs AND ts < @endTs
-    ${provider === "all" ? "" : " AND provider = @provider "}
-    GROUP BY provider, service
-    ORDER BY costUsd DESC
-    LIMIT 50
-  `).all({ startTs: todayStartTs, endTs: nowTs, provider });
-
-  // Merge services
-  const key = (p, s) => `${p}::${s}`;
-  const map = new Map();
-  for (const r of byServiceRollup) {
-    map.set(key(r.provider, r.service), {
-      provider: r.provider,
-      service: r.service,
-      costUsd: Number(r.costUsd) || 0,
-      events: Number(r.events) || 0,
+    const todaySoFarUsd = usageStore.sumRange({
+      billingOwnerId: "", // ignored by the DB query below; keep interface stable
+      provider,
+      startTs: todayStartIso,
+      endTs: nowIso,
     });
-  }
-  for (const r of byServiceToday) {
-    const k = key(r.provider, r.service);
-    const prev = map.get(k) || { provider: r.provider, service: r.service, costUsd: 0, events: 0 };
-    prev.costUsd += Number(r.costUsd) || 0;
-    prev.events += Number(r.events) || 0;
-    map.set(k, prev);
-  }
 
-  const byService = Array.from(map.values()).sort((a, b) => (b.costUsd || 0) - (a.costUsd || 0));
+    // Today active users (distinct subjectUserId)
+    const todayAU = usageDb
+      .prepare(
+        `
+        SELECT COUNT(DISTINCT subjectUserId) AS activeUsers
+        FROM usage_events
+        WHERE ts >= @startTs AND ts < @endTs
+          AND subjectUserId IS NOT NULL
+          AND subjectUserId <> ''
+        ${provider === "all" ? "" : " AND provider = @provider "}
+        `
+      )
+      .get({
+        startTs: todayStartIso,
+        endTs: nowIso,
+        provider,
+      });
 
-  res.json({
-    windowDays: days,
-    provider,
-    startDay,
-    todayStartTs,
-    totals: {
-      rollupUsd: Number(totalRollupUsd) || 0,
-      todaySoFarUsd: todayUsd,
-      totalUsd: (Number(totalRollupUsd) || 0) + todayUsd,
-    },
-    byService,
-  });
+    const activeUsersToday = Number(todayAU?.activeUsers || 0);
+
+    const totalUsd = totalRollupUsd + Number(todaySoFarUsd || 0);
+
+    // If the same user appears in rollups AND today, count distinct overall:
+    // simplest correct approach: compute distinct across (rollups in range) UNION (today events)
+    const distinctOverall = usageDb
+      .prepare(
+        `
+        SELECT COUNT(DISTINCT subjectUserId) AS activeUsers
+        FROM (
+          SELECT subjectUserId
+          FROM daily_usage_rollups
+          WHERE day >= @startDay
+            AND subjectUserId IS NOT NULL AND subjectUserId <> ''
+            ${providerSql}
+          UNION
+          SELECT subjectUserId
+          FROM usage_events
+          WHERE ts >= @todayStart AND ts < @nowTs
+            AND subjectUserId IS NOT NULL AND subjectUserId <> ''
+            ${provider === "all" ? "" : " AND provider = @provider "}
+        )
+        `
+      )
+      .get({
+        startDay,
+        provider,
+        todayStart: todayStartIso,
+        nowTs: nowIso,
+      });
+
+    const activeUsers = Number(distinctOverall?.activeUsers || (activeUsersRollup + activeUsersToday) || 0);
+
+    const costPerActiveUserUsd = activeUsers > 0 ? totalUsd / activeUsers : 0;
+
+    res.json({
+      windowDays: days,
+      provider,
+      totalUsd: Number(totalUsd || 0),
+      activeUsers,
+      costPerActiveUserUsd: Number(costPerActiveUserUsd || 0),
+      note: "activeUsers computed from distinct subjectUserId in rollups + today events.",
+    });
+  } catch (e) {
+    console.error("❌ cost-per-user error:", e);
+    res.status(500).json({ error: "Failed to compute cost-per-user" });
+  }
 });
+
+
+
+app.get("/admin/metrics/by-day", (req, res) => {
+  const days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
+  const provider = String(req.query.provider || "all");
+
+  const start = new Date();
+  start.setUTCDate(start.getUTCDate() - (days - 1));
+  const startDay = start.toISOString().slice(0, 10);
+
+  try {
+    const rows = usageDb
+      .prepare(
+        `
+        SELECT
+          day,
+          COALESCE(SUM(costUsd), 0) AS costUsd,
+          COALESCE(SUM(events), 0) AS events
+        FROM daily_usage_rollups
+        WHERE day >= ?
+          AND (? = 'all' OR provider = ?)
+        GROUP BY day
+        ORDER BY day ASC
+        `
+      )
+      .all(startDay, provider, provider);
+
+    res.json({
+      windowDays: days,
+      provider,
+      series: (rows || []).map((r) => ({
+        day: r.day,
+        costUsd: Number(r.costUsd || 0),
+        events: Number(r.events || 0),
+        activeUsers: 0,
+      })),
+    });
+  } catch (e) {
+    console.error("❌ by-day error:", e);
+    res.status(500).json({ error: "Failed to compute by-day series" });
+  }
+});
+
+
 
 app.get("/admin/metrics/events", (req, res) => {
   if (!requireAdmin(req, res)) return;
@@ -299,6 +518,157 @@ app.get("/admin/metrics/events", (req, res) => {
     count: rows.length,
     items: rows.map(r => ({ ...r, metadata: r.metadataJson ? JSON.parse(r.metadataJson) : {} })),
   });
+});
+
+app.get("/admin/metrics/top-billing-owners", (req, res) => {
+  const days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
+  const provider = String(req.query.provider || "all").trim().toLowerCase();
+  const limit = Math.max(1, Math.min(Number(req.query.limit) || 20, 200));
+
+  const start = new Date();
+  start.setUTCDate(start.getUTCDate() - (days - 1));
+  const startDay = isoDayUtc(start);
+
+  const providerSql = provider === "all" ? "" : " AND provider = @provider ";
+
+  // Optional: friendly labels for known demo IDs
+  const BILLING_LABELS = {
+    u_head: "Head",
+    u_self: "Me",
+    u_spouse: "Spouse",
+    u_child1: "Child 1",
+    u_child2: "Child 2",
+  };
+
+  try {
+    const rows = usageDb
+      .prepare(
+        `
+        SELECT
+          billingOwnerId,
+          COALESCE(SUM(costUsd), 0) AS totalUsd,
+          COALESCE(SUM(events), 0) AS events,
+          COUNT(DISTINCT subjectUserId) AS activeUsers
+        FROM daily_usage_rollups
+        WHERE day >= @startDay
+          AND billingOwnerId IS NOT NULL
+          AND billingOwnerId <> ''
+          ${providerSql}
+        GROUP BY billingOwnerId
+        ORDER BY totalUsd DESC
+        LIMIT @limit
+        `
+      )
+      .all({ startDay, provider, limit });
+
+    res.json({
+      windowDays: days,
+      provider,
+      items: (rows || []).map((r) => {
+        const billingOwnerId = String(r.billingOwnerId || "");
+        return {
+          billingOwnerId,
+          label: BILLING_LABELS[billingOwnerId] || billingOwnerId,
+          totalUsd: Number(r.totalUsd || 0),
+          events: Number(r.events || 0),
+          activeUsers: Number(r.activeUsers || 0),
+        };
+      }),
+    });
+  } catch (e) {
+    console.error("❌ top-billing-owners error:", e);
+    res.status(500).json({ error: "Failed to compute top-billing-owners" });
+  }
+});
+
+
+app.get("/admin/metrics/users", (req, res) => {
+  const days = Math.max(1, Math.min(Number(req.query.days) || 30, 365));
+
+  try {
+    const now = new Date();
+    const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const todayIso = todayStart.toISOString();
+
+    const start = new Date();
+    start.setUTCDate(start.getUTCDate() - (days - 1));
+    const startIso = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate())).toISOString();
+
+    // Total distinct “users” we’ve ever seen (subjectUserId)
+    const totalUsersRow = usageDb.prepare(`
+      SELECT COUNT(DISTINCT subjectUserId) AS c
+      FROM usage_events
+      WHERE subjectUserId IS NOT NULL AND subjectUserId <> ''
+    `).get();
+
+    // Total distinct billing owners we’ve ever seen (families/accounts)
+    const totalFamiliesRow = usageDb.prepare(`
+      SELECT COUNT(DISTINCT billingOwnerId) AS c
+      FROM usage_events
+      WHERE billingOwnerId IS NOT NULL AND billingOwnerId <> ''
+    `).get();
+
+    // DAU (today)
+    const dauRow = usageDb.prepare(`
+      SELECT COUNT(DISTINCT subjectUserId) AS c
+      FROM usage_events
+      WHERE ts >= @start
+        AND subjectUserId IS NOT NULL AND subjectUserId <> ''
+    `).get({ start: todayIso });
+
+    // WAU (last 7d)
+    const wauStart = new Date(todayStart);
+    wauStart.setUTCDate(wauStart.getUTCDate() - 6);
+    const wauIso = wauStart.toISOString();
+
+    const wauRow = usageDb.prepare(`
+      SELECT COUNT(DISTINCT subjectUserId) AS c
+      FROM usage_events
+      WHERE ts >= @start
+        AND subjectUserId IS NOT NULL AND subjectUserId <> ''
+    `).get({ start: wauIso });
+
+    // MAU (last 30d)
+    const mauStart = new Date(todayStart);
+    mauStart.setUTCDate(mauStart.getUTCDate() - 29);
+    const mauIso = mauStart.toISOString();
+
+    const mauRow = usageDb.prepare(`
+      SELECT COUNT(DISTINCT subjectUserId) AS c
+      FROM usage_events
+      WHERE ts >= @start
+        AND subjectUserId IS NOT NULL AND subjectUserId <> ''
+    `).get({ start: mauIso });
+
+    // Active-by-day series (from rollups, last N days)
+    const startDay = isoDayUtc(new Date(startIso));
+    const rows = usageDb.prepare(`
+      SELECT day, COUNT(DISTINCT subjectUserId) AS activeUsers
+      FROM daily_usage_rollups
+      WHERE day >= @startDay
+        AND subjectUserId IS NOT NULL AND subjectUserId <> ''
+      GROUP BY day
+      ORDER BY day ASC
+    `).all({ startDay });
+
+    res.json({
+      totalUsers: Number(totalUsersRow?.c || 0),
+      totalFamilies: Number(totalFamiliesRow?.c || 0),
+      dau: Number(dauRow?.c || 0),
+      wau: Number(wauRow?.c || 0),
+      mau: Number(mauRow?.c || 0),
+      activeByDay: (rows || []).map((r) => ({
+        day: r.day,
+        activeUsers: Number(r.activeUsers || 0),
+      })),
+      note: "Derived from usage_events.subjectUserId and daily_usage_rollups.subjectUserId.",
+      windowDays: days,
+      windowStartIso: startIso,
+    });
+  } catch (e) {
+    console.error("❌ users metrics error:", e);
+    res.status(500).json({ error: "Failed to compute users metrics" });
+  }
 });
 
 
@@ -350,6 +720,43 @@ usageDb.exec(`
   CREATE INDEX IF NOT EXISTS idx_usage_events_subject_ts
     ON usage_events(subjectUserId, ts);
 `);
+
+
+
+// ---- one-time safe migrations (sqlite) ----
+function ensureUsageSchema() {
+  try {
+    usageDb.prepare(`ALTER TABLE usage_events ADD COLUMN subjectUserId TEXT`).run();
+  } catch (e) {
+    // ignore "duplicate column name" etc
+  }
+
+  // Helpful indexes for DAU/WAU/MAU queries
+  try {
+    usageDb.prepare(`CREATE INDEX IF NOT EXISTS idx_usage_events_ts ON usage_events(ts)`).run();
+    usageDb.prepare(
+      `CREATE INDEX IF NOT EXISTS idx_usage_events_subject_ts ON usage_events(subjectUserId, ts)`
+    ).run();
+    usageDb.prepare(
+      `CREATE INDEX IF NOT EXISTS idx_usage_events_owner_ts ON usage_events(billingOwnerId, ts)`
+    ).run();
+  } catch (e) {}
+}
+
+ensureUsageSchema();
+
+function ensureRollupSchema() {
+  try {
+    usageDb.prepare(`ALTER TABLE daily_usage_rollups ADD COLUMN subjectUserId TEXT`).run();
+  } catch (e) {}
+  try {
+    usageDb.prepare(
+      `CREATE INDEX IF NOT EXISTS idx_rollups_day_subject ON daily_usage_rollups(day, subjectUserId)`
+    ).run();
+  } catch (e) {}
+}
+ensureRollupSchema();
+
 
 
 // ============================================================================
