@@ -1,6 +1,6 @@
 // src/server.js – Voravia backend (MVP)
 // Adds: /v1/me (profile-aware family list), /v1/family (alias),
-//       /v1/logs (SQLite), /v1/day-summary, /v1/scans (vision)
+//       /v1/logs (in-memory), /v1/day-summary, /v1/scans (vision)
 // Keeps: your existing /api/* routes (Places + Menu upload/rate)
 
 import express from "express";
@@ -188,24 +188,6 @@ function getSubjectUserId(req, ctx) {
   // fallback = caller user
   return String(ctx?.me?.userId || ctx?.userId || h["x-user-id"] || "").trim();
 }
-
-
-function canDeleteLog(me, logRow) {
-  if (!logRow) return false;
-
-  // Family mode: allow deleting any log belonging to a family member id
-  if (me?.mode === "family") {
-    const allowed = new Set((me.family?.members || []).map((m) => String(m.id)));
-    return allowed.has(String(logRow.userId));
-  }
-
-  // Individual/workplace: only allow deleting active member’s logs
-  const activeId = String(me?.family?.activeMemberId || me?.userId || "u_self");
-  return String(logRow.userId) === activeId;
-}
-
-
-
 
 
 // ============================================================================
@@ -774,122 +756,6 @@ function ensureRollupSchema() {
   } catch (e) {}
 }
 ensureRollupSchema();
-
-
-// ============================================================================
-//  FAMILY MEMBERS (SQLite) - source of truth for names + roles
-// ============================================================================
-
-usageDb.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    familyId TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS families (
-    id TEXT PRIMARY KEY,
-    name TEXT,
-    createdAt TEXT NOT NULL,
-    updatedAt TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS family_members (
-    id TEXT PRIMARY KEY,
-    familyId TEXT NOT NULL,
-    name TEXT NOT NULL,
-    memberType TEXT NOT NULL, -- 'individual' | 'parent' | 'child'
-    createdAt TEXT NOT NULL,
-    updatedAt TEXT NOT NULL,
-    insuranceId TEXT,
-    corporateId TEXT
-  );
-
-
-
-
-  CREATE INDEX IF NOT EXISTS idx_family_members_familyId
-    ON family_members(familyId);
-`);
-
-const userUpsertStmt = usageDb.prepare(`
-  INSERT INTO users(id, familyId)
-  VALUES (@id, @familyId)
-  ON CONFLICT(id) DO UPDATE SET familyId = excluded.familyId
-`);
-
-const userGetStmt = usageDb.prepare(`SELECT id, familyId FROM users WHERE id = ?`);
-
-const familyInsertStmt = usageDb.prepare(`
-  INSERT INTO families(id, name, createdAt, updatedAt)
-  VALUES (@id, @name, @createdAt, @updatedAt)
-`);
-
-const familyGetStmt = usageDb.prepare(`SELECT id, name FROM families WHERE id = ?`);
-const familyDeleteStmt = usageDb.prepare(`DELETE FROM families WHERE id = ?`);
-
-const membersListStmt = usageDb.prepare(`
-  SELECT id, familyId, name, memberType, insuranceId, corporateId, createdAt, updatedAt
-  FROM family_members
-  WHERE familyId = ?
-  ORDER BY createdAt ASC
-`);
-
-
-const memberGetStmt = usageDb.prepare(`
-  SELECT id, familyId, name, memberType, insuranceId, corporateId, createdAt, updatedAt
-  FROM family_members
-  WHERE id = ?
-`);
-
-
-const memberInsertStmt = usageDb.prepare(`
-  INSERT INTO family_members(id, familyId, name, memberType, createdAt, updatedAt)
-  VALUES (@id, @familyId, @name, @memberType, @createdAt, @updatedAt)
-`);
-
-const memberUpdateStmt = usageDb.prepare(`
-  UPDATE family_members
-  SET name = COALESCE(@name, name),
-      memberType = COALESCE(@memberType, memberType),
-      insuranceId = COALESCE(@insuranceId, insuranceId),
-      corporateId = COALESCE(@corporateId, corporateId),
-      updatedAt = @updatedAt
-  WHERE id = @id
-`);
-
-
-const memberDeleteStmt = usageDb.prepare(`DELETE FROM family_members WHERE id = ?`);
-
-const memberCountStmt = usageDb.prepare(`
-  SELECT COUNT(*) AS cnt
-  FROM family_members
-  WHERE familyId = ?
-`);
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function makeFamilyId() {
-  return `fam_${Date.now().toString(36)}_${Math.random().toString(16).slice(2)}`;
-}
-
-function makeMemberId() {
-  return `mem_${Date.now().toString(36)}_${Math.random().toString(16).slice(2)}`;
-}
-
-function normalizeMemberType(x) {
-  const v = String(x || "").toLowerCase().trim();
-  if (v === "parent" || v === "child" || v === "individual") return v;
-  return "parent";
-}
-
-function ensureUserRow(userId) {
-  const existing = userGetStmt.get(userId);
-  if (existing) return existing;
-  userUpsertStmt.run({ id: userId, familyId: null });
-  return userGetStmt.get(userId);
-}
 
 
 
@@ -1563,9 +1429,21 @@ app.get("/v1/group-usage", (req, res) => {
 //  MVP "ME" + FAMILY (profile-aware)
 // ============================================================================
 //
-// ============================================================================
-//  MVP "ME" + FAMILY (DB-backed source of truth)
-// ============================================================================
+// Rules:
+// - If activeProfile === "individual": family = [ {id:"u_self", name:"Me"} ]
+// - If activeProfile === "family": family = [Head, Spouse, Child1, Child2] (no "Me")
+//
+// How we decide activeProfile (MVP):
+// - query param ?profile=family|individual
+// - OR header x-voravia-profile: family|individual
+// - default: family (matches your current focus)
+//
+const FAMILY_MEMBERS = [
+  { id: "u_head", name: "Head" },
+  { id: "u_spouse", name: "Spouse" },
+  { id: "u_child1", name: "Child 1" },
+  { id: "u_child2", name: "Child 2" },
+];
 
 const ME_STATE = new Map(); // userId -> { mode, activeMemberId }
 
@@ -1574,97 +1452,89 @@ function getUserId(req) {
 }
 
 function resolveMode(req) {
+  // Optional explicit override (dev/testing)
   const q = String(req.query.profile || "").toLowerCase().trim();
   const h = String(req.header("x-voravia-profile") || "").toLowerCase().trim();
   const v = q || h;
+
   if (v === "individual" || v === "family" || v === "workplace") return v;
-  return null;
+  return null; // no override
 }
+
 
 function ensureMeState(userId) {
   if (ME_STATE.has(userId)) return ME_STATE.get(userId);
-  const seeded = { mode: "individual", activeMemberId: userId };
+
+  // Default MVP seed: family mode for u_head, individual for u_self
+  const seeded =
+    userId === "u_self"
+      ? { mode: "individual", activeMemberId: "u_self" }
+      : { mode: "family", activeMemberId: "u_head" };
+
   ME_STATE.set(userId, seeded);
   return seeded;
 }
 
-function listFamilyMembersForUser(userId) {
-  const userRow = ensureUserRow(userId);
-  const familyId = String(userRow?.familyId || "");
-  if (!familyId) return { familyId: "", members: [] };
-
-  const fam = familyGetStmt.get(familyId);
-  const members = membersListStmt.all(familyId).map((m) => ({
-    id: String(m.id),
-    displayName: String(m.name || m.id),
-    memberType: String(m.memberType || "parent"),
-  }));
-
-  return { familyId, familyName: fam?.name || "Your Family", members };
-}
 
 function buildMe(req) {
+  //const userId = getUserId(req);
   const userId = req?.ctx?.userId ? String(req.ctx.userId) : getUserId(req);
 
   const state = ensureMeState(userId);
   const overrideMode = resolveMode(req);
+  const mode = overrideMode || state.mode;
 
-  const { familyId, familyName, members } = listFamilyMembersForUser(userId);
-
-  // mode is derived from whether a family exists (unless overridden for dev)
-  let mode = overrideMode || (familyId ? "family" : "individual");
-
-  // Members list:
-  // - family: DB members
-  // - individual: single derived member (the user)
-  const effectiveMembers =
+  // Build family members list (your existing constant)
+  // Expecting FAMILY_MEMBERS like:
+  // [{id:"u_head", name:"Head"}, {id:"u_spouse", name:"Spouse"}, ...]
+  const members =
     mode === "family"
-      ? members
-      : [{ id: userId, displayName: "Me", memberType: "individual" }];
+      ? (FAMILY_MEMBERS || []).map((m) => ({
+          id: String(m.id),
+          displayName: String(m.name || m.displayName || m.id),
+        }))
+      : [{ id: "u_self", displayName: "Me" }];
 
-  // Active member:
-  // - family: state.activeMemberId if in list, else first
-  // - individual: always the userId
-  let activeMemberId = userId;
-  if (mode === "family") {
-    const set = new Set(effectiveMembers.map((m) => m.id));
-    const preferred = String(state.activeMemberId || "");
-    activeMemberId = set.has(preferred) ? preferred : (effectiveMembers[0]?.id || userId);
-  }
+  // active member id
+  const activeMemberId =
+    mode === "family"
+      ? String(state.activeMemberId || "u_head")
+      : "u_self";
 
-  // persist (unless override)
+  // Persist effective mode back to state unless this was an override
   if (!overrideMode) {
-    ME_STATE.set(userId, { ...state, mode, activeMemberId });
+    ME_STATE.set(userId, { ...state, mode });
   }
 
   return {
     userId,
     mode,
     family: {
-      familyId: familyId || null,
-      name: familyName || "Your Family",
       activeMemberId,
-      members: effectiveMembers,
+      members,
     },
     preferences: {
       byMemberId: MEMBER_PREFERENCES,
     },
   };
+  
 }
 
 app.get("/v1/me", (req, res) => {
   res.json(buildMe(req));
 });
 
-// Request ctx depends on /v1/me
+
+
+// Build /v1/me context once per request for downstream routes
 app.use((req, _res, next) => {
   try {
     req.ctx = req.ctx || {};
     req.ctx.me = buildMe(req);
 
-    // Billing owner remains the same semantics: family rolls up to caller (or keep u_head if you prefer)
+    // Billing owner: for now family rolls up to u_head; later replace with real owner id.
     req.ctx.billingOwnerId =
-      req.ctx.me?.mode === "family" ? String(req.ctx.me.userId) : String(req.ctx.me?.userId || req.ctx.userId);
+      req.ctx.me?.mode === "family" ? "u_head" : String(req.ctx.me?.userId || req.ctx.userId);
   } catch {
     req.ctx = req.ctx || {};
     req.ctx.me = null;
@@ -1673,517 +1543,71 @@ app.use((req, _res, next) => {
   next();
 });
 
-// PATCH /v1/me (unchanged behavior)
+// PATCH /v1/me
+// Body examples:
+// { "mode": "family" }
+// { "family": { "activeMemberId": "u_spouse" } }
+// { "mode": "individual", "family": { "activeMemberId": "u_self" } }
+
 app.patch("/v1/me", (req, res) => {
   const userId = getUserId(req);
+
+  // ensure state exists
   const state = ensureMeState(userId);
+
   const body = req.body || {};
 
+  // update mode if provided
   if (body.mode === "individual" || body.mode === "family" || body.mode === "workplace") {
     state.mode = body.mode;
   }
+
+  // update active member if provided
   if (body.family && body.family.activeMemberId !== undefined) {
     state.activeMemberId = String(body.family.activeMemberId || "").trim() || null;
   }
 
   ME_STATE.set(userId, state);
+
+  // respond with canonical /v1/me shape
   res.json(buildMe(req));
 });
 
-// keep /v1/family alias (returns same members as /v1/me)
+
+
 app.get("/v1/family", (req, res) => {
   const me = buildMe(req);
-  res.json({
-    items: me.family.members,
-    activeMemberId: me.family.activeMemberId,
-    userId: me.userId,
-    familyId: me.family.familyId,
-    familyName: me.family.name,
-  });
+  res.json({ items: me.family.members, activeMemberId: me.family.activeMemberId, userId: me.userId });
 });
-
 
 
 // ============================================================================
-//  FAMILY CRUD (MVP)
+//  SIMPLE LOGS (in-memory, structured) + day-summary
 // ============================================================================
-
-// Create family for logged-in user
-app.post("/v1/family", (req, res) => {
-  const userId = String(req.ctx?.userId || getUserId(req));
-  ensureUserRow(userId);
-
-  const body = req.body || {};
-  const familyName = String(body.name || "Your Family").trim() || "Your Family";
-
-  const familyId = makeFamilyId();
-  const ts = nowIso();
-
-  usageDb.transaction(() => {
-    familyInsertStmt.run({ id: familyId, name: familyName, createdAt: ts, updatedAt: ts });
-    userUpsertStmt.run({ id: userId, familyId });
-
-    // Add the creator as a member
-    const memberId = makeMemberId();
-    memberInsertStmt.run({
-      id: memberId,
-      familyId,
-      name: String(body.ownerName || "Me").trim() || "Me",
-      memberType: normalizeMemberType(body.ownerMemberType || "parent"),
-      createdAt: ts,
-      updatedAt: ts,
-    });
-
-    // switch to family mode + set active member
-    const st = ensureMeState(userId);
-    ME_STATE.set(userId, { ...st, mode: "family", activeMemberId: memberId });
-  })();
-
-  const members = membersListStmt.all(familyId).map((m) => ({
-    id: String(m.id),
-    displayName: String(m.name),
-    memberType: String(m.memberType),
-  }));
-
-  res.json({ familyId, name: familyName, members });
-});
-
-// Join family by code (simple: familyId or "FAM-<id>")
-app.post("/v1/family/join", (req, res) => {
-  const userId = String(req.ctx?.userId || getUserId(req));
-  ensureUserRow(userId);
-
-  const code = String(req.body?.code || "").trim();
-  const famId = code.startsWith("FAM-") ? code.slice(4) : code;
-  if (!famId || famId.length < 3) return res.status(400).json({ error: "invalid_code" });
-
-  const fam = familyGetStmt.get(famId);
-  if (!fam) return res.status(404).json({ error: "family_not_found" });
-
-  userUpsertStmt.run({ id: userId, familyId: famId });
-
-  // If user has no member entry in that family, create one
-  const existing = membersListStmt.all(famId);
-  const ts = nowIso();
-  let memberId = existing[0]?.id || null;
-
-  if (!existing.find(() => false)) {
-    // no-op; left intentionally
-  }
-
-  // Always add a member record for this joining user if you want one-per-user.
-  // MVP simplest: add one.
-  memberId = makeMemberId();
-  memberInsertStmt.run({
-    id: memberId,
-    familyId: famId,
-    name: String(req.body?.name || "Member").trim() || "Member",
-    memberType: normalizeMemberType(req.body?.memberType || "parent"),
-    createdAt: ts,
-    updatedAt: ts,
-  });
-
-  const st = ensureMeState(userId);
-  ME_STATE.set(userId, { ...st, mode: "family", activeMemberId: memberId });
-
-  res.json({ ok: true, familyId: famId, familyName: String(fam.name || "Your Family") });
-});
-
-app.get("/v1/family/members", (req, res) => {
-  const userId = String(req.ctx?.userId || getUserId(req));
-  const userRow = ensureUserRow(userId);
-  const familyId = String(userRow?.familyId || "");
-  if (!familyId) return res.json({ items: [] });
-
-  const items = membersListStmt.all(familyId).map((m) => ({
-    id: String(m.id),
-    familyId: String(m.familyId),
-    name: String(m.name),
-    memberType: String(m.memberType),
-    insuranceId: m.insuranceId ?? null,
-    corporateId: m.corporateId ?? null,
-    createdAt: String(m.createdAt),
-    updatedAt: String(m.updatedAt),
-  }));
-  
-
-  res.json({ items });
-});
-
-app.post("/v1/family/members", (req, res) => {
-  const userId = String(req.ctx?.userId || getUserId(req));
-  const userRow = ensureUserRow(userId);
-  const familyId = String(userRow?.familyId || "");
-  if (!familyId) return res.status(400).json({ error: "NO_FAMILY" });
-
-  const name = String(req.body?.name || "").trim();
-  if (!name) return res.status(400).json({ error: "NAME_REQUIRED" });
-
-  const memberType = normalizeMemberType(req.body?.memberType);
-  const ts = nowIso();
-  const id = makeMemberId();
-
-  memberInsertStmt.run({ id, familyId, name, memberType, createdAt: ts, updatedAt: ts });
-
-  res.json({ ok: true, item: { id, familyId, name, memberType, createdAt: ts, updatedAt: ts } });
-});
-
-
-app.patch("/v1/family/members/:memberId", (req, res) => {
-  const userId = String(req.ctx?.userId || getUserId(req));
-  const userRow = ensureUserRow(userId);
-  const familyId = String(userRow?.familyId || "");
-  if (!familyId) return res.status(400).json({ error: "NO_FAMILY" });
-
-  const memberId = String(req.params.memberId || "");
-  const existing = memberGetStmt.get(memberId);
-  if (!existing || String(existing.familyId) !== familyId) return res.status(404).json({ error: "NOT_FOUND" });
-
-  const name =
-  req.body?.name !== undefined ? String(req.body.name || "").trim() : null;
-
-const memberType =
-  req.body?.memberType !== undefined ? normalizeMemberType(req.body.memberType) : null;
-
-const insuranceId =
-  req.body?.insuranceId !== undefined
-    ? (req.body.insuranceId === null ? null : String(req.body.insuranceId))
-    : null;
-
-const corporateId =
-  req.body?.corporateId !== undefined
-    ? (req.body.corporateId === null ? null : String(req.body.corporateId))
-    : null;
-
-const ts = nowIso();
-
-memberUpdateStmt.run({
-  id: memberId,
-  name: name || null,
-  memberType: memberType || null,
-  insuranceId,
-  corporateId,
-  updatedAt: ts,
-});
-
-
-  const updated = memberGetStmt.get(memberId);
-  
-  res.json({
-    ok: true,
-    item: {
-      id: String(updated.id),
-      familyId: String(updated.familyId),
-      name: String(updated.name),
-      memberType: String(updated.memberType),
-      insuranceId: updated.insuranceId ?? null,
-      corporateId: updated.corporateId ?? null,
-      createdAt: String(updated.createdAt),
-      updatedAt: String(updated.updatedAt),
-    },
-  });
-  
-
-
-
-});
-
-// Delete member; if last -> delete family + fallback to individual
-app.delete("/v1/family/members/:memberId", (req, res) => {
-  const userId = String(req.ctx?.userId || getUserId(req));
-  const userRow = ensureUserRow(userId);
-  const familyId = String(userRow?.familyId || "");
-  if (!familyId) return res.status(400).json({ error: "NO_FAMILY" });
-
-  const memberId = String(req.params.memberId || "");
-  const existing = memberGetStmt.get(memberId);
-  if (!existing || String(existing.familyId) !== familyId) return res.status(404).json({ error: "NOT_FOUND" });
-
-  const result = usageDb.transaction(() => {
-    const cnt = Number(memberCountStmt.get(familyId)?.cnt || 0);
-
-    if (cnt > 1) {
-      memberDeleteStmt.run(memberId);
-      return { familyDeleted: false };
-    }
-
-    // last member => delete family group
-    memberDeleteStmt.run(memberId);
-    familyDeleteStmt.run(familyId);
-
-    // clear familyId for all users that point to this family
-    usageDb.prepare(`UPDATE users SET familyId = NULL WHERE familyId = ?`).run(familyId);
-
-    // fallback to individual
-    const st = ensureMeState(userId);
-    ME_STATE.set(userId, { ...st, mode: "individual", activeMemberId: userId });
-
-    return { familyDeleted: true };
-  })();
-
-  res.json({ ok: true, ...result });
-});
-
-
-
-// ============================================================================
-//  LOGS (SQLite, persistent) + day-summary
-// ============================================================================
-usageDb.exec(`
-  CREATE TABLE IF NOT EXISTS meal_logs (
-    id TEXT PRIMARY KEY,
-    createdAt TEXT NOT NULL,
-    day TEXT NOT NULL,
-    userId TEXT NOT NULL,
-    mealType TEXT NOT NULL,
-    source TEXT NOT NULL,
-    dishName TEXT NOT NULL,
-    score REAL NOT NULL,
-    label TEXT NOT NULL,
-    confidence REAL NOT NULL,
-    whyJson TEXT,
-    tipsJson TEXT,
-    nutritionJson TEXT,
-    photoUri TEXT,
-    scanId TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_meal_logs_user_day ON meal_logs(userId, day);
-  CREATE INDEX IF NOT EXISTS idx_meal_logs_created ON meal_logs(createdAt);
-`);
-
-const logsInsertStmt = usageDb.prepare(`
-  INSERT INTO meal_logs
-  (id, createdAt, day, userId, mealType, source, dishName, score, label, confidence, whyJson, tipsJson, nutritionJson, photoUri, scanId)
-  VALUES
-  (@id, @createdAt, @day, @userId, @mealType, @source, @dishName, @score, @label, @confidence, @whyJson, @tipsJson, @nutritionJson, @photoUri, @scanId)
-`);
-
-const logsListStmt = usageDb.prepare(`
-  SELECT id, createdAt, day, userId, mealType, source, dishName, score, label, confidence, whyJson, tipsJson, nutritionJson, photoUri, scanId
-  FROM meal_logs
-  WHERE userId IN (SELECT value FROM json_each(@userIdsJson))
-  ORDER BY createdAt DESC
-  LIMIT @limit
-`);
-
-const logsListByUserStmt = usageDb.prepare(`
-  SELECT id, createdAt, day, userId, mealType, source, dishName, score, label, confidence, whyJson, tipsJson, nutritionJson, photoUri, scanId
-  FROM meal_logs
-  WHERE userId = @userId
-  ORDER BY createdAt DESC
-  LIMIT @limit
-`);
-
-const logsListByUserDayStmt = usageDb.prepare(`
-  SELECT id, createdAt, day, userId, mealType, source, dishName, score, label, confidence, whyJson, tipsJson, nutritionJson, photoUri, scanId
-  FROM meal_logs
-  WHERE userId = @userId AND day = @day
-  ORDER BY createdAt DESC
-  LIMIT @limit
-`);
-
-const logsGetByIdStmt = usageDb.prepare(`
-  SELECT id, createdAt, day, userId, mealType, source, dishName, score, label, confidence, whyJson, tipsJson, nutritionJson, photoUri, scanId
-  FROM meal_logs
-  WHERE id = @id
-  LIMIT 1
-`);
-
-const logsDeleteByIdStmt = usageDb.prepare(`
-  DELETE FROM meal_logs
-  WHERE id = @id
-`);
-
-const logsCountByIdStmt = usageDb.prepare(`
-  SELECT COUNT(1) as c
-  FROM meal_logs
-  WHERE id = @id
-`);
-
-
-function safeJsonParse(s, fallback) {
-  try {
-    return s ? JSON.parse(String(s)) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function normalizeLogRow(r) {
-  return {
-    id: String(r.id),
-    createdAt: String(r.createdAt),
-    day: String(r.day),
-    userId: String(r.userId),
-    mealType: String(r.mealType),
-    source: String(r.source),
-    dishName: String(r.dishName),
-    score: Number(r.score ?? 0),
-    label: String(r.label ?? ""),
-    confidence: Number(r.confidence ?? 0),
-    why: safeJsonParse(r.whyJson, []),
-    tips: safeJsonParse(r.tipsJson, []),
-    nutrition: safeJsonParse(r.nutritionJson, null),
-    photoUri: r.photoUri ? String(r.photoUri) : "",
-    scanId: r.scanId ? String(r.scanId) : undefined,
-  };
-}
+const logs = []; // MVP keep in memory
 
 app.get("/v1/logs", (req, res) => {
-  // Optional explicit filter (debug / detail)
-  const explicitUserId = String(req.query.userId || "").trim();
+  const userId = String(req.query.userId || "").trim();
 
-  const limit = Math.min(500, Math.max(1, Number(req.query.limit || 200) || 200));
-
-  if (explicitUserId) {
-    const rows = logsListByUserStmt.all({ userId: explicitUserId, limit });
-    const items = rows.map((r) => ({
-      ...r,
-      why: safeJsonParse(r.whyJson, []),
-      tips: safeJsonParse(r.tipsJson, []),
-      nutrition: safeJsonParse(r.nutritionJson, null),
-      whyJson: undefined,
-      tipsJson: undefined,
-      nutritionJson: undefined,
-    }));
-    return res.json({ items });
-  }
-
-  // Use request context (already built earlier in your server)
-  const me = req.ctx?.me || null;
-
-  // Family mode: return logs for all members in family
-  if (me?.mode === "family") {
-    const memberIds = (me.family?.members || []).map((m) => String(m.id)).filter(Boolean);
-
-    // Include legacy/subject user ids that your frontend is using today
-const legacyUserIds = ["u_head", "u_spouse", "u_child1", "u_child2", "u_self"];
-
-const ids = Array.from(new Set([...memberIds, ...legacyUserIds]));
-    const userIdsJson = JSON.stringify(memberIds.length ? memberIds : [String(me.userId || req.ctx?.userId || "u_head")]);
-
-    const rows = logsListStmt.all({ userIdsJson, limit });
-    const items = rows.map((r) => ({
-      ...r,
-      why: safeJsonParse(r.whyJson, []),
-      tips: safeJsonParse(r.tipsJson, []),
-      nutrition: safeJsonParse(r.nutritionJson, null),
-      whyJson: undefined,
-      tipsJson: undefined,
-      nutritionJson: undefined,
-    }));
-    return res.json({ items });
-  }
-
-  // Individual / workplace: return logs for active member (or self)
-  const activeId = String(me?.family?.activeMemberId || me?.userId || req.ctx?.userId || "u_self");
-  const rows = logsListByUserStmt.all({ userId: activeId, limit });
-  const items = rows.map((r) => ({
-    ...r,
-    why: safeJsonParse(r.whyJson, []),
-    tips: safeJsonParse(r.tipsJson, []),
-    nutrition: safeJsonParse(r.nutritionJson, null),
-    whyJson: undefined,
-    tipsJson: undefined,
-    nutritionJson: undefined,
-  }));
-  return res.json({ items });
+  const filtered = userId ? logs.filter((x) => x.userId === userId) : logs;
+  // newest first
+  res.json({ items: filtered.slice().reverse().slice(0, 200) });
 });
-
-// DELETE a log
-app.delete("/v1/logs/:id", (req, res) => {
-  try {
-    const userId = String(req.headers["x-user-id"] || "");
-    const id = String(req.params.id || "");
-
-    if (!userId) return res.status(401).json({ error: "missing x-user-id" });
-    if (!id) return res.status(400).json({ error: "missing id" });
-
-    // IMPORTANT: use whatever you store logs in (sqlite table, array, etc.)
-    // You must delete ONLY if the log belongs to the same userId (or same family policy if you allow it).
-    const ok = logsStore.deleteById({ id, userId }); // <- implement using your existing store
-
-    if (!ok) return res.status(404).json({ error: "log not found" });
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.status(500).json({ error: "failed to delete log" });
-  }
-});
-
 
 app.post("/v1/logs", (req, res) => {
-
-  console.log("[/v1/logs POST] body keys:", Object.keys(req.body || {}), "userId:", (req.body || {}).userId);
-
-  function normalizeLoggedForUserId(rawUserId, me) {
-    const uid = String(rawUserId || "").trim();
-  
-    // If already a family member id, keep it
-    if (uid.startsWith("mem_")) return uid;
-  
-    // If family mode and caller used legacy ids, map them to the right member
-    if (me?.mode === "family") {
-      const members = me.family?.members || [];
-  
-      // Heuristic: if your member objects include any stable mapping field, use it.
-      // If not, fall back: u_self -> activeMemberId (best approximation)
-      if (uid === "u_self") return String(me.family?.activeMemberId || uid);
-  
-      // Optional: map known ids by member name if you have conventions
-      // (If your family has exact names "Spouse", "Child 1", etc.)
-      if (uid === "u_head") return String(me.family?.activeMemberId || uid);
-    }
-  
-    return uid || "u_self";
-  }
-  
-
-
-
   const item = req.body || {};
 
-  // accept multiple payload shapes
-  const rawScore =
-    item.score ??
-    item.rating?.score ??
-    item.result?.score ??
-    item.ratingScore ??
-    item.resultScore;
-
-  const rawLabel =
-    item.label ??
-    item.rating?.label ??
-    item.result?.label ??
-    item.ratingLabel ??
-    item.resultLabel;
-
-  const rawConfidence =
-    item.confidence ??
-    item.rating?.confidence ??
-    item.result?.confidence ??
-    0;
-
-
-    const me = req.ctx?.me || null;
-    const loggedFor = normalizeLoggedForUserId(item.userId, me);
-
   const entry = {
-    
     id: `log_${Date.now()}_${Math.random().toString(16).slice(2)}`,
     createdAt: new Date().toISOString(),
     day: item.day ? String(item.day) : isoDay(),
-
-    // IMPORTANT: this is the "logged-for" member id (mem_...) or user id (u_...)
-    //userId: String(item.userId || "u_self"),
-    userId: loggedFor,
-
+    userId: String(item.userId || "u_self"),
     mealType: String(item.mealType || "lunch"),
     source: String(item.source || "scan"),
     dishName: String(item.dishName || "Unknown dish"),
-    score: clampScore(rawScore),
-    label: String(rawLabel || ""),
-    confidence: Number(rawConfidence ?? 0),
-
+    score: clampScore(item.score),
+    label: String(item.label || ""),
+    confidence: Number(item.confidence ?? 0),
     why: Array.isArray(item.why) ? item.why.map(String) : [],
     tips: Array.isArray(item.tips) ? item.tips.map(String) : [],
     nutrition: item.nutrition || item.estimatedNutrition || null,
@@ -2191,102 +1615,96 @@ app.post("/v1/logs", (req, res) => {
     scanId: item.scanId ? String(item.scanId) : undefined,
   };
 
-  logsInsertStmt.run({
-    ...entry,
-    whyJson: JSON.stringify(entry.why || []),
-    tipsJson: JSON.stringify(entry.tips || []),
-    nutritionJson: JSON.stringify(entry.nutrition ?? null),
-  });
-
+  logs.push(entry);
   res.json({ ok: true, item: entry });
 });
 
+// Meal weights for DAILY score (Phase 1)
+const MEAL_WEIGHTS = {
+  breakfast: 0.25,
+  lunch: 0.30,
+  dinner: 0.35,
+  snack: 0.10,
+};
 
-// ---------- DAY SUMMARY (today + rolling average) ----------
-// GET /v1/day-summary?userId=<memberId>&windowDays=1|14&day=YYYY-MM-DD
-// Returns: { userId, day, mealsLogged, dailyScore, avgScore, windowDays, nextWin }
-const dayScoresRangeStmt = usageDb.prepare(`
-  SELECT day, AVG(score) AS avgScore, COUNT(*) AS meals
-  FROM meal_logs
-  WHERE userId = @userId
-    AND day >= @startDay
-    AND day <= @endDay
-  GROUP BY day
-  ORDER BY day ASC
-`);
+function caloriesOf(log) {
+  const n = log?.nutrition || {};
+  const c = Number(n.caloriesKcal ?? n.calories ?? 0);
+  return Number.isFinite(c) && c > 0 ? c : 0;
+}
+
+function weightedAvgScore(items) {
+  // calories-weighted if we have calories; else simple average
+  const withCals = items.filter((x) => caloriesOf(x) > 0);
+  if (withCals.length) {
+    let wSum = 0;
+    let sSum = 0;
+    for (const it of withCals) {
+      const w = caloriesOf(it);
+      wSum += w;
+      sSum += w * clampScore(it.score);
+    }
+    return wSum > 0 ? sSum / wSum : 0;
+  }
+
+  if (!items.length) return 0;
+  const sum = items.reduce((a, x) => a + clampScore(x.score), 0);
+  return sum / items.length;
+}
 
 app.get("/v1/day-summary", (req, res) => {
-  try {
-    const me = req.ctx?.me || null;
+  const userId = String(req.query.userId || "").trim() || "u_self";
+  const day = String(req.query.day || "").trim() || isoDay();
 
-    const userId =
-      String(req.query.userId || "").trim() ||
-      String(me?.family?.activeMemberId || me?.userId || req.ctx?.userId || "u_self");
+  const dayLogs = logs.filter((x) => x.userId === userId && String(x.day) === day);
 
-    const windowDays = Math.max(1, Math.min(Number(req.query.windowDays) || 1, 60));
+  const byMeal = {
+    breakfast: dayLogs.filter((x) => x.mealType === "breakfast"),
+    lunch: dayLogs.filter((x) => x.mealType === "lunch"),
+    dinner: dayLogs.filter((x) => x.mealType === "dinner"),
+    snack: dayLogs.filter((x) => x.mealType === "snack"),
+  };
 
-    const day = String(req.query.day || "").trim() || isoDay();
+  // meal scores (multiple items per meal -> calories-weighted avg)
+  const mealScore = {
+    breakfast: weightedAvgScore(byMeal.breakfast),
+    lunch: weightedAvgScore(byMeal.lunch),
+    dinner: weightedAvgScore(byMeal.dinner),
+    snack: weightedAvgScore(byMeal.snack),
+  };
 
-    // Use UTC day boundaries for stability
-    const end = new Date(`${day}T00:00:00.000Z`);
-    const start = new Date(end);
-    start.setUTCDate(start.getUTCDate() - (windowDays - 1));
-
-    const startDay = isoDayUtc(start);
-    const endDay = isoDayUtc(end);
-
-    const rows = dayScoresRangeStmt.all({ userId, startDay, endDay }) || [];
-
-    const byDay = new Map();
-    for (const r of rows) {
-      const d = String(r.day || "");
-      byDay.set(d, {
-        day: d,
-        avgScore: clampScore(Number(r.avgScore || 0)),
-        meals: Number(r.meals || 0),
-      });
-    }
-
-    const todayRow = byDay.get(day) || null;
-    const dailyScore = todayRow ? todayRow.avgScore : 0;
-    const mealsLogged = todayRow ? todayRow.meals : 0;
-
-    // Rolling average = average of per-day averages across days with >=1 meal
-    const daysWithMeals = Array.from(byDay.values()).filter((x) => Number(x.meals) > 0);
-    const avgScore =
-      daysWithMeals.length > 0
-        ? clampScore(
-            daysWithMeals.reduce((a, x) => a + Number(x.avgScore || 0), 0) / daysWithMeals.length
-          )
-        : 0;
-
-    const nextWin =
-      dailyScore >= 80
-        ? ["Keep it consistent", "Protein + veggies", "Hydrate"]
-        : dailyScore >= 60
-        ? ["Add fiber", "Keep sodium moderate", "Choose lean protein"]
-        : ["Avoid sugary drinks", "Add protein", "Add vegetables/beans"];
-
-    res.json({
-      userId,
-      day,
-      mealsLogged,
-      dailyScore,
-      avgScore,
-      windowDays,
-      nextWin,
-    });
-  } catch (e) {
-    console.error("day-summary error:", e);
-    res.status(500).json({ error: "day_summary_error" });
+  // day score = weighted average across meals actually logged
+  let totalW = 0;
+  let totalS = 0;
+  for (const mt of ["breakfast", "lunch", "dinner", "snack"]) {
+    const list = byMeal[mt];
+    if (!list.length) continue;
+    const w = MEAL_WEIGHTS[mt] ?? 0;
+    totalW += w;
+    totalS += w * (mealScore[mt] ?? 0);
   }
+  const dailyScore = totalW > 0 ? totalS / totalW : 0;
+
+  // simple “next win” suggestion (Phase 1)
+  const nextWin = [];
+  if (!dayLogs.length) nextWin.push("Log one meal to start your day score");
+  else if (dailyScore < 50) nextWin.push("Next meal: aim for protein + fiber (avoid sugary / fried)");
+  else if (dailyScore < 70) nextWin.push("Next meal: add fiber (veggies/whole grains) and keep sodium moderate");
+  else nextWin.push("Next meal: keep balance—protein + veggies, watch extra sodium");
+
+  res.json({
+    userId,
+    day,
+    dailyScore: Math.round(dailyScore),
+    mealScore: {
+      breakfast: Math.round(mealScore.breakfast || 0),
+      lunch: Math.round(mealScore.lunch || 0),
+      dinner: Math.round(mealScore.dinner || 0),
+      snack: Math.round(mealScore.snack || 0),
+    },
+    nextWin,
+  });
 });
-
-
-
-
-
-
 
 
 // ============================================================================
@@ -2574,7 +1992,7 @@ app.get("/v1/home-recommendations", (req, res) => {
   
 
 
-  const dayLogs = logsListByUserDayStmt.all({ userId: memberId, day, limit: 500 }).map(normalizeLogRow);
+  const dayLogs = logs.filter((x) => x.userId === memberId && String(x.day) === day);
   const mealsLogged = dayLogs.length;
 
   // Avg score (simple average; you can swap to weightedAvgScore if desired)
