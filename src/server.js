@@ -15,6 +15,9 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import Database from "better-sqlite3";
 import { requireAdminSession, handleAdminLogin } from "./adminAuth.mjs";
+import fs from "fs";
+import path from "path";
+
 
 
 const app = express();
@@ -29,7 +32,39 @@ console.log("OPENAI KEY LOADED:", !!process.env.OPENAI_API_KEY);
 // ----------------------------------------------------------------------------
 //  SECURITY + COMPLIANCE BASELINE MIDDLEWARE (MVP-SAFE)
 // ----------------------------------------------------------------------------
+
+// Uploads Directory - Create the uploads directory if it doesn't exist. Serve uploaded files. Upload endpoint (base64 JSON).//
+
+const uploadsDir = path.join(process.cwd(), "uploads");
+fs.mkdirSync(uploadsDir, { recursive: true });
+
+// Serve uploaded files
+app.use("/uploads", express.static(uploadsDir));
+
+// Upload endpoint (base64 JSON)
+app.post("/v1/uploads", express.json({ limit: "20mb" }), (req, res) => {
+  try {
+    const { base64, ext = "jpg" } = req.body || {};
+    if (!base64) return res.status(400).json({ error: "missing base64" });
+
+    const safeExt = String(ext).toLowerCase().replace(/[^a-z0-9]/g, "") || "jpg";
+    const id = crypto.randomUUID();
+    const filename = `${id}.${safeExt}`;
+    const filePath = path.join(uploadsDir, filename);
+
+    fs.writeFileSync(filePath, Buffer.from(base64, "base64"));
+    return res.json({ url: `/uploads/${filename}` });
+  } catch (e) {
+    return res.status(500).json({ error: "upload failed", details: String(e?.message || e) });
+  }
+});
+
+
+
+
+
 // 1) Security headers (safe defaults; relax later if needed)
+
 app.use(
     helmet({
       // Keep default protections; explicitly disable CSP for MVP since you serve API only.
@@ -2029,86 +2064,106 @@ function normalizeLogRow(r) {
   };
 }
 
+function inClausePlaceholders(n) {
+  return Array.from({ length: n }, () => "?").join(", ");
+}
+
 app.get("/v1/logs", (req, res) => {
-  // Optional explicit filter (debug / detail)
-  const explicitUserId = String(req.query.userId || "").trim();
+  try {
+    const limitRaw = Number(req.query.limit ?? 200);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, limitRaw)) : 200;
 
-  const limit = Math.min(500, Math.max(1, Number(req.query.limit || 200) || 200));
+    const uid = String(req.ctx?.userId || "").trim();
+    const me = req.ctx?.me || null;
+    if (!uid) return res.status(401).json({ error: "Not authenticated" });
 
-  if (explicitUserId) {
-    const rows = logsListByUserStmt.all({ userId: explicitUserId, limit });
-    const items = rows.map((r) => ({
-      ...r,
-      why: safeJsonParse(r.whyJson, []),
-      tips: safeJsonParse(r.tipsJson, []),
-      nutrition: safeJsonParse(r.nutritionJson, null),
-      whyJson: undefined,
-      tipsJson: undefined,
-      nutritionJson: undefined,
-    }));
-    return res.json({ items });
+    // meal_logs.userId stores member IDs in family mode (mem_*)
+    let allowedIds = [];
+    if (me?.mode === "family") {
+      allowedIds = (me.family?.members || []).map((m) => String(m.id)).filter(Boolean);
+    } else {
+      const active = String(me?.family?.activeMemberId || me?.userId || uid || "u_self");
+      allowedIds = [active].filter(Boolean);
+    }
+
+    if (!allowedIds.length) return res.json({ logs: [] });
+
+    // Optional: filter to one memberId (must be allowed)
+    const requested = req.query.userId ? String(req.query.userId).trim() : "";
+    if (requested) {
+      if (!allowedIds.includes(requested)) {
+        return res.status(403).json({ error: "Not allowed to view logs for that userId" });
+      }
+      allowedIds = [requested];
+    }
+
+    const rows = logsListStmt.all({
+      userIdsJson: JSON.stringify(allowedIds),
+      limit,
+    });
+
+    return res.json({ logs: rows.map(normalizeLogRow) });
+  } catch (e) {
+    return res.status(500).json({ error: "Failed to fetch logs", details: String(e?.message || e) });
   }
-
-  // Use request context (already built earlier in your server)
-  const me = req.ctx?.me || null;
-
-  // Family mode: return logs for all members in family
-  if (me?.mode === "family") {
-    const memberIds = (me.family?.members || []).map((m) => String(m.id)).filter(Boolean);
-
-    // Include legacy/subject user ids that your frontend is using today
-const legacyUserIds = ["u_head", "u_spouse", "u_child1", "u_child2", "u_self"];
-
-const ids = Array.from(new Set([...memberIds, ...legacyUserIds]));
-    const userIdsJson = JSON.stringify(memberIds.length ? memberIds : [String(me.userId || req.ctx?.userId || "u_head")]);
-
-    const rows = logsListStmt.all({ userIdsJson, limit });
-    const items = rows.map((r) => ({
-      ...r,
-      why: safeJsonParse(r.whyJson, []),
-      tips: safeJsonParse(r.tipsJson, []),
-      nutrition: safeJsonParse(r.nutritionJson, null),
-      whyJson: undefined,
-      tipsJson: undefined,
-      nutritionJson: undefined,
-    }));
-    return res.json({ items });
-  }
-
-  // Individual / workplace: return logs for active member (or self)
-  const activeId = String(me?.family?.activeMemberId || me?.userId || req.ctx?.userId || "u_self");
-  const rows = logsListByUserStmt.all({ userId: activeId, limit });
-  const items = rows.map((r) => ({
-    ...r,
-    why: safeJsonParse(r.whyJson, []),
-    tips: safeJsonParse(r.tipsJson, []),
-    nutrition: safeJsonParse(r.nutritionJson, null),
-    whyJson: undefined,
-    tipsJson: undefined,
-    nutritionJson: undefined,
-  }));
-  return res.json({ items });
 });
 
-// DELETE a log
-app.delete("/v1/logs/:id", (req, res) => {
-  try {
-    const userId = String(req.headers["x-user-id"] || "");
-    const id = String(req.params.id || "");
 
-    if (!userId) return res.status(401).json({ error: "missing x-user-id" });
+app.get("/v1/logs/:id", (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).json({ error: "missing id" });
 
-    // IMPORTANT: use whatever you store logs in (sqlite table, array, etc.)
-    // You must delete ONLY if the log belongs to the same userId (or same family policy if you allow it).
-    const ok = logsStore.deleteById({ id, userId }); // <- implement using your existing store
+    const uid = String(req.ctx?.userId || "").trim();
+    const me = req.ctx?.me || null;
+    if (!uid) return res.status(401).json({ error: "Not authenticated" });
 
-    if (!ok) return res.status(404).json({ error: "log not found" });
-    return res.json({ ok: true });
+    const row = logsGetByIdStmt.get({ id }); // <-- should be prepared on usageDb already
+    if (!row) return res.status(404).json({ error: "Log item not found." });
+
+    // reuse your existing policy helper if present
+    if (typeof canDeleteLog === "function") {
+      // same check works for "can view" in your MVP
+      if (!canDeleteLog(me, row)) return res.status(403).json({ error: "forbidden" });
+    }
+
+    return res.json({ log: normalizeLogRow(row) });
   } catch (e) {
-    return res.status(500).json({ error: "failed to delete log" });
+    return res.status(500).json({ error: "Failed to load log", details: String(e?.message || e) });
   }
 });
+
+
+
+// DELETE a log (SQLite-backed)
+app.delete("/v1/logs/:id", (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ error: "missing id" });
+
+    const uid = String(req.ctx?.userId || "").trim();
+    const me = req.ctx?.me || null;
+    if (!uid) return res.status(401).json({ error: "Not authenticated" });
+
+    const row = logsGetByIdStmt.get({ id });
+    if (!row) return res.status(404).json({ error: "log not found" });
+
+    if (!canDeleteLog(me, row)) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+
+    const info = logsDeleteByIdStmt.run({ id });
+    if (!info || Number(info.changes || 0) < 1) {
+      return res.status(404).json({ error: "log not found" });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: "failed to delete log", details: String(e?.message || e) });
+  }
+});
+
+
 
 
 app.post("/v1/logs", (req, res) => {
